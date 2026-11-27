@@ -1,0 +1,12 @@
+# Sitio estático — sin build. Netlify publica solo la carpeta public/.
+[build]
+  publish = "public"
+  command = ""
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "no-referrer"
+    X-Robots-Tag = "noindex, nofollow"
