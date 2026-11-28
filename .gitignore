@@ -1,0 +1,5 @@
+# Claves y notas privadas: nunca al repo (el repo es público)
+private/
+
+# Estado local de los skills de diseño
+.taste-skill/

@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "nota": "Capa base. Los cambios hechos en la app se guardan en una capa local encima de esta (mismo id = misma tarjeta y mismo número). Variables: {saludo} {agente} {sot} {cliente}",
+  "items": [
+    {
+      "id": "s1",
+      "tag": "Apertura",
+      "title": "Saludo inicial",
+      "text": "{saludo}, le saluda {agente} de la Mesa de Seguimiento de Claro. ¿Me comunico con {cliente}? Le llamo por su orden de servicio {sot}."
+    },
+    {
+      "id": "s2",
+      "tag": "Visita",
+      "title": "Confirmación de visita",
+      "text": "Le confirmo que su visita técnica está programada. El técnico se comunicará con usted antes de llegar. ¿El número de contacto sigue siendo el mismo?"
+    },
+    {
+      "id": "s3",
+      "tag": "Reprogramación",
+      "title": "Reprogramación",
+      "text": "Entiendo, {cliente}. Vamos a reprogramar su visita. ¿Qué fecha y franja le acomodan mejor: mañana o tarde?"
+    },
+    {
+      "id": "s4",
+      "tag": "Validación",
+      "title": "Validación de datos",
+      "text": "Para continuar, ¿me confirma la dirección completa del servicio y un número de contacto alternativo, por favor?"
+    },
+    {
+      "id": "s5",
+      "tag": "Cierre",
+      "title": "Despedida",
+      "text": "Gracias por su tiempo, {cliente}. Su caso queda registrado con la orden {sot}. Le atendió {agente}. Que tenga un buen día."
+    }
+  ]
+}
