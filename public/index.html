@@ -1,331 +1,273 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="es" data-radius="none">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MDA · Mesa de Ayuda</title>
-<meta name="theme-color" content="#0a0e14">
+<meta name="description" content="Consola interna de la Mesa de Ayuda: plantillas en vivo, medidor coaxial, tablas rápidas.">
 <meta name="robots" content="noindex, nofollow">
-<meta name="description" content="MDA — consola interna de la Mesa de Ayuda: plantillas de automatización, medidor HFC/FTTH, tabla temporal y conversor Excel→JSON.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#000000">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23000'/%3E%3Crect x='3' y='3' width='10' height='10' fill='none' stroke='%232bff88' stroke-width='2'/%3E%3Crect x='6' y='6' width='4' height='4' fill='%232bff88'/%3E%3C/svg%3E">
+<link rel="preload" href="fonts/martian-mono-latin-standard-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/epilogue-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+<a class="skip" href="#main">Saltar al contenido</a>
 
-<!-- ════════════════ PUERTA DE ACCESO (temporal) ════════════════ -->
-<div id="gate" class="gate">
-  <div class="gate-card">
-    <div class="gate-logo" aria-hidden="true">
-      <svg viewBox="0 0 32 32" width="34" height="34" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M16 3 4 8v8c0 7 5 11 12 13 7-2 12-6 12-13V8L16 3Z"/>
-        <path d="M11 16l3.5 3.5L21 12"/>
-      </svg>
-    </div>
+<!-- ═════════ ACCESO ═════════ -->
+<div id="gate" class="gate" hidden>
+  <form class="gate-card" id="gateForm" autocomplete="off">
+    <div class="gate-mark" aria-hidden="true"><span></span></div>
     <h1 class="gate-title">MDA</h1>
-    <p class="gate-sub">Mesa de Ayuda · acceso temporal de pruebas</p>
-    <label class="gate-label" for="gatePass">Clave de acceso</label>
+    <p class="gate-sub">Mesa de Ayuda · consola interna</p>
+    <label class="lbl" for="gatePass">Clave de acceso</label>
     <div class="gate-row">
-      <input type="password" id="gatePass" placeholder="Ingresa la clave" autocomplete="off" spellcheck="false">
-      <button class="btn btn-accent" id="gateBtn" type="button">Entrar</button>
+      <input type="password" id="gatePass" placeholder="••••••••" spellcheck="false" autocomplete="current-password">
+      <button class="btn btn-primary" id="gateBtn" type="submit">Entrar</button>
     </div>
-    <p class="gate-error" id="gateError" role="alert"></p>
-    <p class="gate-note">Consola interna · diseñada por Engineer M.</p>
-  </div>
+    <p class="gate-msg" id="gateMsg" role="status" aria-live="polite"></p>
+    <p class="gate-foot">Engineer M.</p>
+  </form>
 </div>
 
-<!-- ════════════════ APP ════════════════ -->
+<!-- ═════════ APP ═════════ -->
 <div id="app" class="app" hidden>
 
   <header class="topbar">
     <div class="brand">
-      <span class="brand-mark" aria-hidden="true">
-        <svg viewBox="0 0 32 32" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M16 3 4 8v8c0 7 5 11 12 13 7-2 12-6 12-13V8L16 3Z"/>
-          <path d="M11 16l3.5 3.5L21 12"/>
-        </svg>
-      </span>
-      <div class="brand-text">
-        <strong>MDA</strong>
-        <span>Mesa de Ayuda</span>
-      </div>
+      <span class="brand-mark" aria-hidden="true"><span></span></span>
+      <span class="brand-name">MDA</span>
     </div>
-    <div class="topbar-credit">Engineer M.</div>
+
+    <nav class="quick" aria-label="Enlaces rápidos">
+      <div class="quick-links" id="quickLinks"></div>
+      <div class="pop-wrap">
+        <button class="tbtn" id="allLinksBtn" type="button" aria-expanded="false" aria-controls="linksPop">Todos los enlaces</button>
+        <div class="pop pop-links" id="linksPop" hidden>
+          <div class="pop-head"><strong>Enlaces de la mesa</strong><button class="x" type="button" data-close="linksPop" aria-label="Cerrar">×</button></div>
+          <div class="links-grid" id="linksGrid"></div>
+        </div>
+      </div>
+    </nav>
+
+    <div class="tools">
+      <div class="pop-wrap">
+        <button class="tbtn tbtn-ftth" id="ftthBtn" type="button" aria-expanded="false" aria-controls="ftthPop">FTTH</button>
+        <div class="pop pop-ftth" id="ftthPop" hidden role="dialog" aria-label="Rangos FTTH">
+          <div class="pop-head"><strong>Rangos FTTH · potencia RX en la ONT</strong><button class="x" type="button" data-close="ftthPop" aria-label="Cerrar">×</button></div>
+          <ul class="ranges">
+            <li class="r-ok"><span>Óptimo</span><b>−8.2 a −22.8 dBm</b></li>
+            <li class="r-warn"><span>Aceptable · borde</span><b>−6.1 a −8.1 · −22.9 a −24.9 dBm</b></li>
+            <li class="r-bad"><span>Fuera de rango</span><b>sobre −6.1 (saturada) · bajo −24.9 (débil)</b></li>
+          </ul>
+          <p class="pop-note">Más cerca de 0 = señal más fuerte. Ejemplo: −15 dBm está en el rango óptimo.</p>
+          <div class="pop-timer" id="ftthTimer"></div>
+        </div>
+      </div>
+      <button class="tbtn tbtn-speech" id="speechBtn" type="button" data-feature="speech" aria-controls="speechDrawer" hidden>Speechs</button>
+      <div class="who">
+        <span class="who-name" id="whoName">—</span>
+        <span class="who-tag" id="whoTag">—</span>
+      </div>
+      <button class="tbtn" id="logoutBtn" type="button">Salir</button>
+    </div>
   </header>
 
-  <nav class="nav" id="nav" aria-label="Secciones">
-    <button class="nav-tab is-active" data-view="plantillas" type="button">
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4h6a1 1 0 0 1 1 1v0H8v0a1 1 0 0 1 1-1Z"/><path d="M7 5H5a1 1 0 0 0-1 1v13a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1h-2"/><path d="M9 12h6M9 16h4"/></svg>
-      <span>Plantillas</span>
-    </button>
-    <button class="nav-tab" data-view="medidor" type="button">
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 13a4 4 0 0 0 4-4V5a4 4 0 1 0-8 0v4a4 4 0 0 0 4 4Z"/><path d="M5 9H4M20 9h-1M12 13v8"/></svg>
-      <span>Medidor</span>
-    </button>
-    <button class="nav-tab" data-view="tabla" type="button">
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 4v16M15 4v16"/></svg>
-      <span>Tabla temporal</span>
-    </button>
-    <button class="nav-tab" data-view="tepj" type="button">
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 8l-4 4 4 4M15 8l4 4-4 4"/></svg>
-      <span>TEPJ</span>
-    </button>
-    <button class="nav-tab" data-view="accesos" type="button">
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1"/></svg>
-      <span>Accesos</span>
-    </button>
+  <nav class="tabs" id="tabs" aria-label="Secciones">
+    <button class="tab is-active" data-view="plantillas" type="button">Plantillas</button>
+    <button class="tab" data-view="coaxial" type="button">Coaxial</button>
+    <button class="tab" data-view="tablas" type="button">Tablas rápidas</button>
+    <button class="tab" data-view="entrenamiento" data-feature="entrenamiento" type="button" hidden>Entrenamiento</button>
+    <button class="tab" data-view="senior" data-feature="senior" type="button" hidden>Senior</button>
   </nav>
 
-  <main class="views">
+  <main id="main">
 
-    <!-- ░░░ PLANTILLAS ░░░ -->
-    <section class="view is-active" id="view-plantillas">
-      <div class="split solo" id="plantillasSplit">
-        <div class="panel">
-          <div class="seg" id="catTabs" role="tablist">
-            <button class="seg-btn is-active" data-cat="dia" type="button">Del día</button>
-            <button class="seg-btn" data-cat="reprogramacion" type="button">Reprogramación</button>
-            <button class="seg-btn" data-cat="rechazo" type="button">Rechazo y cierre</button>
+    <!-- ─────────── PLANTILLAS ─────────── -->
+    <section class="view is-active" id="view-plantillas" aria-label="Plantillas">
+      <div class="work">
+
+        <div class="pane pane-content">
+          <div class="pane-head">
+            <h2>Contenido</h2>
+            <span class="pane-meta" id="fillMeta">0 / 0</span>
           </div>
 
-          <div class="field">
-            <label for="plantillaSelect">Plantilla</label>
-            <select id="plantillaSelect"></select>
-            <p class="field-hint" id="plantillaHint"></p>
-          </div>
+          <div class="cats seg" id="cats" role="tablist" aria-label="Categoría"></div>
+          <div class="tpl-list" id="tplList" role="listbox" aria-label="Plantilla"></div>
 
-          <div class="field">
-            <label for="campoSOT">SOT</label>
-            <input type="text" id="campoSOT" placeholder="Ej: 87383157" inputmode="numeric" autocomplete="off">
-          </div>
-
-          <div class="field" id="motivoWrap" hidden>
-            <div class="grid-2">
-              <div>
-                <label for="motivoTipo">Responsable</label>
-                <select id="motivoTipo">
-                  <option value="">— Seleccionar —</option>
-                  <option value="CLARO">CLARO</option>
-                  <option value="CLIENTE">CLIENTE</option>
-                </select>
-              </div>
-              <div>
-                <label for="motivoDetalle">Detalle</label>
-                <select id="motivoDetalle"><option value="">— Primero el responsable —</option></select>
-              </div>
+          <div class="case">
+            <div class="f f-sot">
+              <label class="lbl" for="sot">SOT</label>
+              <input type="text" id="sot" placeholder="87383157" inputmode="numeric" autocomplete="off">
+            </div>
+            <div class="f">
+              <label class="lbl" for="agent">Realizado por</label>
+              <input type="text" id="agent" placeholder="NOMBRE APELLIDO - A365" autocomplete="off">
             </div>
           </div>
 
-          <div id="fieldsContainer"></div>
-
-          <div class="field">
-            <label for="agentName">Realizado por</label>
-            <input type="text" id="agentName" value="ENGINEER M. - A365" autocomplete="off">
+          <div class="toa" id="toaBox" hidden>
+            <label class="lbl" for="toaInput">Pegar texto de TOA <em>· opcional</em></label>
+            <textarea id="toaInput" rows="3" placeholder="En TOA: abre la actividad, Ctrl+A, Ctrl+C y pega aquí. Los campos se llenan solos."></textarea>
+            <div class="toa-status" id="toaStatus">esperando texto</div>
           </div>
 
-          <button class="btn btn-accent btn-block" id="genBtn" type="button">Generar texto</button>
+          <div class="fgrid" id="fields"></div>
         </div>
 
-        <div class="panel panel-output" id="ticketShell" hidden>
-          <div class="output-head">
-            <span class="output-tag" id="ticketLabel">SEGUIMIENTO</span>
-            <span class="output-sot" id="ticketSot">SOT —</span>
+        <div class="pane pane-gen">
+          <div class="pane-head">
+            <h2>Generador</h2>
+            <span class="pane-meta" id="genSot">SOT —</span>
           </div>
-          <pre class="output" id="output"></pre>
-          <div class="actions">
-            <button class="btn btn-accent" id="copyBtn" type="button">Copiar plantilla</button>
-            <button class="btn btn-ghost" id="clearBtn" type="button">Limpiar</button>
-            <span class="feedback" id="copyFeedback">¡Copiado!</span>
+          <div class="gen-bar">
+            <div class="seg seg-sm" id="modeSeg" role="radiogroup" aria-label="Formato">
+              <button type="button" data-mode="tab" class="is-on" role="radio" aria-checked="true">Tabulado</button>
+              <button type="button" data-mode="hz" role="radio" aria-checked="false">Horizontal</button>
+            </div>
+            <label class="sep" id="sepWrap" hidden>
+              <span class="lbl">Separador</span>
+              <select id="sepSel">
+                <option value=" | ">|</option>
+                <option value=" - ">-</option>
+                <option value=" · ">·</option>
+                <option value=" / ">/</option>
+              </select>
+            </label>
+            <span class="gen-title" id="genTitle">—</span>
+          </div>
+          <pre class="out" id="out" aria-live="polite"></pre>
+          <div class="gen-foot">
+            <div class="gen-status" id="genStatus"></div>
+            <div class="gen-actions">
+              <button class="btn btn-secondary" id="newCaseBtn" type="button">Nuevo caso</button>
+              <button class="btn btn-primary" id="copyBtn" type="button">Copiar texto</button>
+            </div>
           </div>
         </div>
+
       </div>
     </section>
 
-    <!-- ░░░ MEDIDOR ░░░ -->
-    <section class="view" id="view-medidor">
-      <div class="seg seg-inline" id="medidorTabs" role="tablist">
-        <button class="seg-btn is-active" data-tech="hfc" type="button">Coaxial · HFC</button>
-        <button class="seg-btn" data-tech="ftth" type="button">Fibra · FTTH</button>
-      </div>
-
-      <!-- HFC -->
-      <div class="panel med-panel is-active" id="panel-hfc">
-        <div class="split split-equal">
-          <div>
-            <h2 class="panel-title">Lecturas de la señal</h2>
-            <p class="panel-hint">Pega los valores separados por comas, saltos de línea o espacios.</p>
-            <textarea id="hfc-input" placeholder="Ej: 38.2, 37.9, 38.5, 38.0, 37.7…"></textarea>
-            <div class="row-between">
-              <label class="micro" for="hfc-threshold">Umbral de estabilidad (dB)</label>
-              <input class="num-sm" type="number" id="hfc-threshold" value="4" step="0.1">
-            </div>
-            <button class="btn btn-ghost btn-sm" id="hfc-clear" type="button">Limpiar</button>
+    <!-- ─────────── COAXIAL ─────────── -->
+    <section class="view" id="view-coaxial" aria-label="Medidor coaxial">
+      <div class="coax">
+        <div class="pane-head"><h2>Medidor coaxial · HFC</h2><button class="btn-link" id="coaxClear" type="button">Limpiar</button></div>
+        <div class="coax-grid">
+          <div class="f f-wide">
+            <label class="lbl" for="coaxIn">Lecturas SNR (dB) · separadas por coma, espacio o salto de línea</label>
+            <textarea id="coaxIn" rows="3" placeholder="38.2, 37.9, 38.5, 38.0, 37.7"></textarea>
           </div>
-          <div>
-            <h2 class="panel-title">Lectura</h2>
-            <div class="readouts">
-              <div class="readout"><span class="readout-label">Máximo</span><span class="readout-value" id="hfc-max">—<i>dB</i></span></div>
-              <div class="readout"><span class="readout-label">Mínimo</span><span class="readout-value" id="hfc-min">—<i>dB</i></span></div>
-              <div class="readout"><span class="readout-label">Diferencia</span><span class="readout-value" id="hfc-diff">—<i>dB</i></span></div>
-              <div class="readout"><span class="readout-label">Valores</span><span class="readout-value" id="hfc-count">0</span></div>
-            </div>
-            <svg class="spark" id="hfc-spark" viewBox="0 0 300 70" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <div class="f">
+            <label class="lbl" for="coaxThr">Umbral de estabilidad (dB)</label>
+            <input type="number" id="coaxThr" value="4" step="0.1">
+          </div>
+          <div class="f">
+            <label class="lbl" for="coaxUsnr">U/S SNR (dB) <em>· sobre 28</em></label>
+            <div class="in-chip"><input type="number" id="coaxUsnr" step="0.1" placeholder="35"><span class="chip" id="usnrChip">—</span></div>
+          </div>
+          <div class="f">
+            <label class="lbl" for="coaxPow">Upstream (dBmV) <em>· 36.1 a 52.9</em></label>
+            <div class="in-chip"><input type="number" id="coaxPow" step="0.1" placeholder="45"><span class="chip" id="powChip">—</span></div>
           </div>
         </div>
-
-        <div class="split split-equal">
-          <div>
-            <h2 class="panel-title">Mediciones adicionales</h2>
-            <div class="measure">
-              <div class="measure-top"><label for="hfc-usnr">U/S SNR (dB)</label><span class="chip" id="hfc-usnr-chip">—</span></div>
-              <input class="num-lg" type="number" id="hfc-usnr" step="0.1" placeholder="Ej: 35">
-              <p class="measure-spec">Debe estar sobre 28 dB</p>
-            </div>
-            <div class="measure">
-              <div class="measure-top"><label for="hfc-uspow">Potencia Upstream (dBmV)</label><span class="chip" id="hfc-uspow-chip">—</span></div>
-              <input class="num-lg" type="number" id="hfc-uspow" step="0.1" placeholder="Ej: 45">
-              <p class="measure-spec">Debe estar entre 36.1 y 52.9 dBmV</p>
-            </div>
-          </div>
-          <div class="verdict-box" id="hfc-verdict-box">
-            <span class="status-dot" id="hfc-light"></span>
-            <div>
-              <p class="verdict" id="hfc-verdict">Esperando valores…</p>
-              <p class="verdict-detail" id="hfc-detail">Pega una lista de lecturas para evaluar la estabilidad de la señal.</p>
-            </div>
-          </div>
+        <div class="coax-read">
+          <div><span class="lbl">Máx</span><b id="cMax">—</b></div>
+          <div><span class="lbl">Mín</span><b id="cMin">—</b></div>
+          <div><span class="lbl">Dif</span><b id="cDiff">—</b></div>
+          <div><span class="lbl">Lecturas</span><b id="cN">0</b></div>
+          <svg class="spark" id="cSpark" viewBox="0 0 200 40" preserveAspectRatio="none" aria-hidden="true"></svg>
         </div>
-      </div>
-
-      <!-- FTTH -->
-      <div class="panel med-panel" id="panel-ftth" hidden>
-        <div class="split split-equal">
-          <div>
-            <h2 class="panel-title">Nivel medido</h2>
-            <div class="level-row">
-              <input class="num-xl" type="number" id="ftth-level" value="0" step="0.1">
-              <span class="unit">dBm</span>
-            </div>
-            <button class="btn btn-ghost btn-sm" id="ftth-clear" type="button">Limpiar</button>
-            <div class="range-config">
-              <label class="micro" for="ftth-from">Rango aceptable</label>
-              <div class="row-between">
-                <span class="micro">desde</span>
-                <input class="num-sm" type="number" id="ftth-from" value="-6.1" step="0.1">
-              </div>
-              <div class="row-between">
-                <span class="micro">hasta</span>
-                <input class="num-sm" type="number" id="ftth-to" value="-24.9" step="0.1">
-              </div>
-              <div class="row-between">
-                <span class="micro">margen advertencia</span>
-                <input class="num-sm" type="number" id="ftth-margin" value="2" step="0.1">
-              </div>
-            </div>
-          </div>
-          <div>
-            <h2 class="panel-title">Medidor</h2>
-            <div class="gauge-labels">
-              <span id="ftth-weak-label">-30.00 dBm · débil</span>
-              <span id="ftth-strong-label">-6.00 dBm · fuerte</span>
-            </div>
-            <div class="led-bar" id="ftth-led-bar"></div>
-            <p class="gauge-pos" id="ftth-pos">Posición en el rango: 0%</p>
-            <div class="legend">
-              <span><i class="dot-ok"></i>Óptimo</span>
-              <span><i class="dot-warn"></i>Aceptable</span>
-              <span><i class="dot-bad"></i>No aceptable</span>
-            </div>
-          </div>
-        </div>
-        <div class="verdict-box" id="ftth-verdict-box">
-          <span class="status-dot" id="ftth-light"></span>
-          <div>
-            <p class="verdict" id="ftth-verdict">—</p>
-            <p class="verdict-detail" id="ftth-detail">Ajusta el nivel medido para evaluar el estado de la señal óptica.</p>
-          </div>
-        </div>
+        <div class="verdict" id="cVerdict"><span class="v-dot"></span><span class="v-text">Esperando lecturas</span></div>
       </div>
     </section>
 
-    <!-- ░░░ TABLA TEMPORAL ░░░ -->
-    <section class="view" id="view-tabla">
-      <div class="panel">
-        <div class="view-head">
-          <div>
-            <h2 class="panel-title">Tabla temporal</h2>
-            <p class="panel-hint">Editor rápido con persistencia local. Recarga la página y los datos siguen aquí.</p>
+    <!-- ─────────── TABLAS RÁPIDAS ─────────── -->
+    <section class="view" id="view-tablas" aria-label="Tablas rápidas">
+      <div class="qt">
+        <aside class="qt-side">
+          <div class="pane-head"><h2>Tablas</h2><button class="btn-link" id="qtNew" type="button">+ Nueva</button></div>
+          <ul class="qt-list" id="qtList"></ul>
+        </aside>
+
+        <div class="qt-main">
+          <div class="qt-bar">
+            <input type="text" id="qtName" class="qt-name" aria-label="Nombre de la tabla" spellcheck="false">
+            <input type="search" id="qtSearch" placeholder="Buscar en la tabla" aria-label="Buscar en la tabla">
+            <button class="btn btn-secondary" id="qtAddCol" type="button">+ Columna</button>
+            <button class="btn btn-primary" id="qtAddRow" type="button">+ Fila</button>
           </div>
-          <div class="toolbar">
-            <button class="btn btn-ghost btn-sm" id="ttAddRow" type="button">+ Fila</button>
-            <button class="btn btn-ghost btn-sm" id="ttAddCol" type="button">+ Columna</button>
-            <button class="btn btn-ghost btn-sm" id="ttExport" type="button">Exportar JSON</button>
-            <button class="btn btn-danger btn-sm" id="ttClear" type="button">Vaciar</button>
-          </div>
+          <div class="qt-scroll"><table class="qt-table" id="qtTable"></table></div>
+          <p class="qt-hint">Se guarda solo. Enter en la última fila agrega otra. ✓ marca la fila como revisada.</p>
         </div>
-        <div class="table-scroll">
-          <table class="ttable" id="ttTable"></table>
-        </div>
-        <div class="field" style="margin-top:18px;">
-          <label for="ttNotes">Notas</label>
-          <textarea id="ttNotes" placeholder="Apuntes libres, también se guardan…"></textarea>
-        </div>
-        <p class="micro tt-status" id="ttStatus"></p>
+
+        <aside class="qt-notes">
+          <div class="pane-head"><h2>Notas rápidas</h2><button class="btn-link" id="noteNew" type="button">+ Nota</button></div>
+          <div class="notes" id="notes"></div>
+        </aside>
       </div>
     </section>
 
-    <!-- ░░░ TEPJ (Excel → JSON) ░░░ -->
-    <section class="view" id="view-tepj">
-      <div class="panel">
-        <div class="view-head">
-          <div>
-            <h2 class="panel-title">TEPJ · Excel → JSON</h2>
-            <p class="panel-hint">Copia el rango en Excel (Ctrl+C) y pégalo abajo. Se convierte y visualiza como JSON.</p>
-          </div>
-          <div class="toolbar">
-            <label class="check"><input type="checkbox" id="tepjHeader" checked> Primera fila = encabezado</label>
-          </div>
-        </div>
-        <textarea id="tepjInput" placeholder="Pega aquí los datos copiados de Excel…"></textarea>
-        <div class="row-between tepj-meta">
-          <span class="micro" id="tepjMeta">Sin datos</span>
-          <div class="toolbar">
-            <button class="btn btn-ghost btn-sm" id="tepjCopy" type="button">Copiar JSON</button>
-            <button class="btn btn-ghost btn-sm" id="tepjDownload" type="button">Descargar JSON</button>
-          </div>
-        </div>
-        <div class="split split-equal tepj-split">
-          <div>
-            <h3 class="sub-title">Vista previa</h3>
-            <div class="table-scroll"><table class="ttable" id="tepjTable"></table></div>
-          </div>
-          <div>
-            <h3 class="sub-title">JSON</h3>
-            <pre class="json-view" id="tepjJson">{}</pre>
-          </div>
-        </div>
+    <!-- ─────────── PERFILES AVANZADOS (reservado) ─────────── -->
+    <section class="view" id="view-entrenamiento" aria-label="Entrenamiento">
+      <div class="reserved">
+        <h2>Entrenamiento</h2>
+        <p>Espacio reservado para las herramientas de entrenamiento. Mientras tanto este perfil tiene todo lo del agente: plantillas, coaxial, tablas y enlaces.</p>
       </div>
     </section>
-
-    <!-- ░░░ ACCESOS ░░░ -->
-    <section class="view" id="view-accesos">
-      <div class="panel">
-        <h2 class="panel-title">Accesos rápidos de la mesa</h2>
-        <p class="panel-hint">Enlaces internos en nueva pestaña.</p>
-        <div class="link-grid" id="linkGrid"></div>
+    <section class="view" id="view-senior" aria-label="Senior">
+      <div class="reserved">
+        <h2>Senior</h2>
+        <p>Espacio reservado para las herramientas senior. Mientras tanto este perfil tiene todo lo del agente: plantillas, coaxial, tablas y enlaces.</p>
       </div>
     </section>
 
   </main>
 
-  <footer class="appfoot">
-    MDA · consola interna — diseñada por <strong>Engineer M.</strong>
-  </footer>
+  <footer class="foot">MDA · Engineer M.</footer>
 </div>
 
-<div class="toast" id="toast" role="status"></div>
+<!-- ═════════ SPEECHS (perfil especial) ═════════ -->
+<aside class="drawer" id="speechDrawer" hidden aria-label="Speechs">
+  <div class="drawer-head">
+    <h2>Speechs</h2>
+    <div class="drawer-actions">
+      <button class="btn-link" id="spLayerBtn" type="button">Capa JSON</button>
+      <button class="btn-link" id="spNewBtn" type="button">+ Nuevo</button>
+      <button class="x" type="button" id="spClose" aria-label="Cerrar">×</button>
+    </div>
+  </div>
+  <input type="search" id="spSearch" class="sp-search" placeholder="Buscar speech" aria-label="Buscar speech">
+  <p class="sp-vars">Variables: <code>{saludo}</code> <code>{agente}</code> <code>{sot}</code> <code>{cliente}</code></p>
+  <div class="sp-list" id="spList"></div>
 
+  <form class="sp-edit" id="spEdit" hidden>
+    <div class="f"><label class="lbl" for="spTitle">Título</label><input type="text" id="spTitle" required></div>
+    <div class="f"><label class="lbl" for="spTag">Etiqueta</label><input type="text" id="spTag" placeholder="Apertura"></div>
+    <div class="f"><label class="lbl" for="spText">Texto</label><textarea id="spText" rows="7" required></textarea></div>
+    <div class="row-end">
+      <button class="btn btn-secondary" type="button" id="spCancel">Cancelar</button>
+      <button class="btn btn-primary" type="submit">Guardar</button>
+    </div>
+  </form>
+
+  <div class="sp-layer" id="spLayer" hidden>
+    <p class="sp-layer-note">La capa local va encima del archivo base. Un <code>id</code> igual al de la base reemplaza esa tarjeta y conserva su número. <code>"_hidden": true</code> la oculta. Solo vive en este navegador.</p>
+    <textarea id="spLayerText" rows="12" spellcheck="false" aria-label="Capa JSON"></textarea>
+    <div class="row-end">
+      <button class="btn-link danger" type="button" id="spReset">Borrar capa</button>
+      <button class="btn btn-secondary" type="button" id="spLayerCopy">Copiar</button>
+      <button class="btn btn-primary" type="button" id="spLayerApply">Aplicar capa</button>
+    </div>
+  </div>
+</aside>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script src="templates.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -1,1233 +1,892 @@
 /* ════════════════════════════════════════════════════════════
-   MDA · Mesa de Ayuda — lógica de la consola
-   Base de diseño: skill "impeccable" (pbakaus). Autor: Engineer M.
+   MDA · consola de la Mesa de Ayuda
+   Autor: Engineer M.
 
-   NOTA DE SEGURIDAD (puerta de acceso):
-   La clave de abajo es un control de acceso CLIENTE (front-end) para
-   pruebas temporales y poco tráfico. No es seguridad real: cualquiera
-   puede ver el código fuente. Para producción usa la protección de
-   contraseño de Netlify o una Netlify Function con auth real.
+   Acceso: la página solo guarda hashes PBKDF2 de las claves (las claves
+   en texto plano viven en private/, fuera del repo y fuera del sitio).
+   Es un control de acceso en el navegador para pruebas: no reemplaza
+   una autenticación en servidor.
    ════════════════════════════════════════════════════════════ */
 'use strict';
 
-const APP_PASSWORD = 'mda2026';
+/* ───────────────────────── Perfiles ───────────────────────── */
+const KDF_ITER = 150000;
+const PROFILES = {
+  clasico:       { label:'Agente', hash:'2275f61f5a0f7d49d91a680fe2b1e77740a1374858adff09bc3cb22a400d6412',
+                   features:['plantillas','coaxial','tablas'] },
+  especial:      { label:'Agente especial', hash:'ac67f911ef518bf0e34a4da906a356686f69ff7973ef93d9e6a0eb26cfb75639',
+                   features:['plantillas','coaxial','tablas','speech'], user:'CAPILLO HIDALGO MOISÉS A.' },
+  entrenamiento: { label:'Entrenamiento', hash:'288b7677f327c3a0b0112cf2e201eed9dd0fa0dfdd972679cb3f20ca2324b4eb',
+                   features:['plantillas','coaxial','tablas','entrenamiento'] },
+  senior:        { label:'Senior', hash:'56b073f3c013480ed9a57b4efe0b1316df4f9fe3fd304a39a58550d8166ed673',
+                   features:['plantillas','coaxial','tablas','senior'] }
+};
 
 /* ───────────────────────── Utilidades ───────────────────────── */
 const $  = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+const pad2 = n => String(n).padStart(2, '0');
+
+const LS = {
+  get(k, fb){ try{ const v = localStorage.getItem(k); return v == null ? fb : JSON.parse(v); }catch(e){ return fb; } },
+  set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} },
+  del(k){ try{ localStorage.removeItem(k); }catch(e){} }
+};
+const SS = {
+  get(k){ try{ const v = sessionStorage.getItem(k); return v == null ? null : JSON.parse(v); }catch(e){ return null; } },
+  set(k, v){ try{ sessionStorage.setItem(k, JSON.stringify(v)); }catch(e){} },
+  del(k){ try{ sessionStorage.removeItem(k); }catch(e){} }
+};
+
+let PROFILE_ID = null;
+const k = name => `mda.${PROFILE_ID}.${name}`;   // datos separados por perfil
 
 const toastEl = $('#toast');
-let toastTimer = null;
-function showToast(msg, warn = false){
-  toastEl.textContent = msg;
-  toastEl.className = 'toast show' + (warn ? ' warn' : '');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2200);
+let toastT = null;
+function toast(msg, opt = {}){
+  clearTimeout(toastT);
+  toastEl.innerHTML = '';
+  const span = document.createElement('span'); span.textContent = msg; toastEl.appendChild(span);
+  if(opt.action){
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = opt.action.label;
+    b.addEventListener('click', () => { opt.action.run(); toastEl.classList.remove('show'); });
+    toastEl.appendChild(b);
+  }
+  toastEl.className = 'toast show' + (opt.warn ? ' warn' : '');
+  toastT = setTimeout(() => toastEl.classList.remove('show'), opt.ms || 2200);
 }
-function markError(el){
-  if(!el) return;
-  el.classList.add('input-error');
-  setTimeout(() => el.classList.remove('input-error'), 2500);
+function copyText(text){
+  if(navigator.clipboard && window.isSecureContext){
+    return navigator.clipboard.writeText(text).catch(() => legacyCopy(text));
+  }
+  return Promise.resolve(legacyCopy(text));
 }
-const store = {
-  get(k, fb){ try{ const v = localStorage.getItem(k); return v == null ? fb : JSON.parse(v); }catch(e){ return fb; } },
-  set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
-};
+function legacyCopy(text){
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.setAttribute('readonly', ''); ta.style.cssText = 'position:fixed;opacity:0;left:-9999px';
+  document.body.appendChild(ta); ta.select();
+  try{ document.execCommand('copy'); }catch(e){}
+  ta.remove();
+}
 
-/* ───────────────────────── Puerta de acceso ───────────────────────── */
-(function gate(){
-  const gate = $('#gate');
-  const pass = $('#gatePass');
-  const btn  = $('#gateBtn');
-  const err  = $('#gateError');
+/* ════════════════════════════════════════════════════════════
+   SESIÓN · dura mientras quede al menos una pestaña abierta.
+   Una pestaña nueva pregunta por BroadcastChannel si hay otra viva
+   con sesión; si responde, hereda ese perfil. Al cerrar todas, se pide
+   la clave otra vez. (Los temporizadores se congelan en pestañas de
+   fondo, por eso no se usa un "latido" con setInterval.)
+   ════════════════════════════════════════════════════════════ */
+const SESSION_KEY = 'mda.session';
+const chan = ('BroadcastChannel' in window) ? new BroadcastChannel('mda') : null;
 
-  function tryEnter(){
-    if(pass.value === APP_PASSWORD){
-      try{ sessionStorage.setItem('mda_gate','1'); }catch(e){}
-      err.classList.remove('show');
-      gate.style.display = 'none';
-      $('#app').hidden = false;
-      initApp();
+function askOtherTabs(timeout = 300){
+  return new Promise(resolve => {
+    if(!chan) return resolve(null);
+    const nonce = uid();
+    const onMsg = e => {
+      if(e.data && e.data.type === 'pong' && e.data.nonce === nonce && PROFILES[e.data.p]){
+        chan.removeEventListener('message', onMsg); clearTimeout(t); resolve(e.data.p);
+      }
+    };
+    chan.addEventListener('message', onMsg);
+    chan.postMessage({ type:'ping', nonce });
+    const t = setTimeout(() => { chan.removeEventListener('message', onMsg); resolve(null); }, timeout);
+  });
+}
+if(chan){
+  chan.addEventListener('message', e => {
+    const d = e.data || {};
+    if(d.type === 'ping' && PROFILE_ID) chan.postMessage({ type:'pong', nonce:d.nonce, p:PROFILE_ID });
+    if(d.type === 'logout' && PROFILE_ID){ SS.del(SESSION_KEY); location.reload(); }
+  });
+}
+window.addEventListener('storage', e => {
+  if(e.key === SESSION_KEY && PROFILE_ID){
+    const nv = e.newValue ? JSON.parse(e.newValue) : null;
+    if(!nv){ SS.del(SESSION_KEY); location.reload(); }
+    else if(nv.p !== PROFILE_ID){ SS.set(SESSION_KEY, nv); location.reload(); }
+  }
+});
+
+async function resumeSession(){
+  const shared = LS.get(SESSION_KEY, null);
+  if(!shared || !PROFILES[shared.p]) return null;
+  const mine = SS.get(SESSION_KEY);
+  if(mine && mine.p === shared.p) return shared.p;          // recarga o pestaña duplicada
+  if(!chan) return shared.p;                                  // navegador sin BroadcastChannel
+  const p = await askOtherTabs();
+  if(p){ SS.set(SESSION_KEY, { p }); return p; }              // otra pestaña viva: hereda su cuenta
+  LS.del(SESSION_KEY);                                        // no queda ninguna: sesión cerrada
+  return null;
+}
+function startSession(p){
+  LS.set(SESSION_KEY, { p, t:Date.now() });
+  SS.set(SESSION_KEY, { p });
+}
+function endSession(){
+  LS.del(SESSION_KEY); SS.del(SESSION_KEY);
+  if(chan) chan.postMessage({ type:'logout' });
+  location.reload();
+}
+
+/* ───────────────────────── Puerta ───────────────────────── */
+async function derive(pass, id){
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(pass), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name:'PBKDF2', salt:enc.encode('mda.v2.' + id), iterations:KDF_ITER, hash:'SHA-256' }, key, 256);
+  return [...new Uint8Array(bits)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+async function matchProfile(pass){
+  for(const id of Object.keys(PROFILES)){
+    if(await derive(pass, id) === PROFILES[id].hash) return id;
+  }
+  return null;
+}
+
+function setupGate(){
+  const form = $('#gateForm'), pass = $('#gatePass'), msg = $('#gateMsg'), btn = $('#gateBtn'), card = $('.gate-card');
+  let fails = 0, lockUntil = 0;
+  if(!(window.crypto && crypto.subtle)){
+    msg.textContent = 'Este navegador necesita abrir la página por HTTPS.'; msg.className = 'gate-msg bad';
+  }
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    if(Date.now() < lockUntil){ msg.textContent = `Espera ${Math.ceil((lockUntil - Date.now())/1000)} s.`; msg.className = 'gate-msg bad'; return; }
+    const v = pass.value;
+    if(!v) return pass.focus();
+    btn.disabled = true; msg.textContent = 'Verificando…'; msg.className = 'gate-msg';
+    let p = null;
+    try{ p = await matchProfile(v); }catch(err){ msg.textContent = 'No se pudo verificar en este navegador.'; msg.className = 'gate-msg bad'; btn.disabled = false; return; }
+    btn.disabled = false;
+    if(p){
+      pass.value = ''; msg.textContent = '';
+      startSession(p); enterApp(p);
     } else {
-      err.textContent = 'Clave incorrecta. Inténtalo de nuevo.';
-      err.classList.add('show');
-      gate.classList.remove('shake'); void gate.offsetWidth; gate.classList.add('shake');
-      pass.focus();
+      fails++;
+      if(fails >= 5){ lockUntil = Date.now() + 30000; fails = 0; }
+      msg.textContent = 'Clave incorrecta.'; msg.className = 'gate-msg bad';
+      card.classList.remove('shake'); void card.offsetWidth; card.classList.add('shake');
+      pass.select();
     }
-  }
-  btn.addEventListener('click', tryEnter);
-  pass.addEventListener('keydown', e => { if(e.key === 'Enter') tryEnter(); });
-  let unlocked = false;
-  try{ unlocked = sessionStorage.getItem('mda_gate') === '1'; }catch(e){}
-  if(unlocked){ gate.style.display = 'none'; $('#app').hidden = false; initApp(); }
-  else pass.focus();
-})();
-
-let appReady = false;
-function initApp(){
-  if(appReady) return;
-  appReady = true;
-
-  setupNav();
-  setupPlantillas();
-  setupMedidor();
-  setupTabla();
-  setupTEPJ();
-  setupAccesos();
-
-  // "Realizado por" persistido
-  const agent = $('#agentName');
-  const savedAgent = store.get('mda_agent', null);
-  if(savedAgent) agent.value = savedAgent;
-  agent.addEventListener('input', () => store.set('mda_agent', agent.value));
-
-  poblarSelectPlantillas();
-}
-
-/* ───────────────────────── Navegación entre vistas ───────────────────────── */
-function setupNav(){
-  const tabs = $$('#nav .nav-tab');
-  const views = $$('.view');
-  tabs.forEach(t => t.addEventListener('click', () => {
-    const v = t.dataset.view;
-    tabs.forEach(x => x.classList.toggle('is-active', x === t));
-    views.forEach(x => x.classList.toggle('is-active', x.id === 'view-' + v));
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }));
+  });
 }
 
 /* ════════════════════════════════════════════════════════════
-   PLANTILLAS DE AUTOMATIZACIÓN
+   APP
    ════════════════════════════════════════════════════════════ */
-const RECHAZO_MOTIVOS = {
-  "CLIENTE NO DESEA EL SERVICIO": [
-    "Solicito otra fecha de instalación de la venta",
-    "Cliente tiene servicio con otro operador",
-    "Titular no ha contratado ningún servicio a Claro",
-    "Demora en la atención de la solicitud, ya no desea esperar.",
-    "Cliente no desea servicio por Motivos personales (económico, familiar, laboral)",
-    "Cliente no desea servicio por cambio de titularidad"
-  ],
-  "FACILIDADES TECNICAS DEL CLIENTE": [
-    "Dueño de Casa y/o Edificio no autoriza la instalación",
-    "Al momento de la instalación no hay acceso al techo",
-    "Al momento de la instalación se valida ducterias obstruidas.",
-    "Cliente cuenta con SOT de suspensión y/o baja.",
-    "Cliente indica que no tiene disponibilidad y se volverá a comunicar y/o excede el tiempo de reprogramación"
-  ],
-  "FALTA DE CONTACTO": [
-    "No hay contacto con el cliente (unicos números errados o faltan dígitos)"
-  ],
-  "MAL INGRESO DE DIRECCION": [
-    "Dirección registrada en el sistema es errada. (numero, Lt, Mz, nombre calle, distrito)",
-    "Se llego a domicilio, pero cliente no vive en esta Dirección"
-  ],
-  "SOT MAL GENERADO": [
-    "Error en sistemas al generar la sot"
-  ],
-  "POR DUPLICIDAD": [
-    "se atendió con otra SOT",
-    "se rechazo con otra SOT",
-    "Se genero doble SOT por diferentes puntos de venta"
-  ],
-  "TRANSACCION NO AUTORIZADA, ERROR DE ETIQUETA": [
-    "POSIBLE FRAUDE"
-  ],
-  "MALA OFERTA": [
-    "Tecnología incorrecta",
-    "Velocidad de Internet no es acorde a lo solicitado por el cliente",
-    "Cantidad o Modelo de Decos no es acorde a lo solicitado por el cliente",
-    "Cliente solicito atención PostVenta (Decos adicionales, traslados, etc).",
-    "No amerita cambio de router porque soporta la velocidad contratada.",
-    "Decodificadores descontinuados.",
-    "Producto incorrecto (Falta de play).",
-    "Equipos incompatibles"
-  ]
-};
+function enterApp(p){
+  PROFILE_ID = p;
+  const prof = PROFILES[p];
+  $('#gate').hidden = true;
+  $('#app').hidden = false;
 
-const CIERRE_MOTIVOS = {
-  "INCIDENCIA MAL GENERADA": [
-    "DATOS ERRADOS",
-    "CLIENTE DARA DE BAJA EL SERVICIO",
-    "YA NO DESEA LA VISITA",
-    "DUPLICIDAD",
-    "SERVICIO SUSPENDIDO O BAJA"
-  ],
-  "OK LINEA": [
-    "DATOS ERRADOS",
-    "CLIENTE DARA DE BAJA EL SERVICIO",
-    "YA NO DESEA LA VISITA",
-    "DUPLICIDAD",
-    "SERVICIO SUSPENDIDO O BAJA"
-  ],
-  "EJECUTADO Y MOVILIZADO": [
-    "CLIENTE DARA DE BAJA EL SERVICIO",
-    "CLIENTE AUSENTE",
-    "CLIENTE INFORMA SERVICIO CONFORME / VISITA TECNICA",
-    "NO HAY FACILIDAD TECNICA"
-  ]
-};
+  $$('[data-feature]').forEach(el => { el.hidden = !prof.features.includes(el.dataset.feature); });
 
-const SEG_MOTIVOS = {
-  CLARO: [
-    'Pérdida de fecha de agendamiento',
-    'Caída masiva en sistemas Claro',
-    'Inasistencia de cuadrillas de la contratista',
-    'Retraso de técnicos de la contratista',
-    'Incidencias en el campo durante la instalación',
-    'Falta de materiales: Detallar material',
-    'Retiro anticipado de cuadrillas en campo',
-    'Falta de herramientas',
-    'Sobreagendamiento de cuotas',
-    'Problemas con las configuraciones de zonas de trabajo',
-    'Cuota configurada incorrectamente'
-  ],
-  CLIENTE: [
-    'Cambios en las fechas y franjas de visita solicitados por el cliente',
-    'Cliente se encuentra de viaje',
-    'Solo puede domingos, horarios especiales, noche',
-    'Cliente desconoce su fecha agendamiento y no puede atender a técnicos',
-    'Cliente no cuenta con los equipos en el nuevo domicilio',
-    'Cliente no brinda facilidades técnicas: ducterías o cableados o ambientes o permisos de edificio',
-    'Factores climatológicos',
-    'Cliente no responde los 4 intentos de llamada (falta de contacto)',
-    'Cliente Ausente en Campo'
-  ]
-};
-
-const SEG_PLANTILLAS = {
-  dia: [
-    {
-      id:'sd1', titulo:'SEGUIMIENTO TÉCNICO', subtitulo:'',
-      usaContactabilidad:true,
-      campos:[
-        {id:'tecnico',    label:'Técnico',        placeholder:'Nombre del técnico'},
-        {id:'telefono',   label:'Teléfono',        placeholder:'Ej: 987654321'},
-        {id:'id_llamada', label:'ID de Llamada',   placeholder:'Ej: 123456789'},
-        {id:'observacion',label:'Observación',     placeholder:'Detalle de la gestión'}
-      ],
-      template:(v,sot,u)=>{
-        const now=new Date();
-        const fecha=now.toLocaleDateString('es-PE',{day:'2-digit',month:'2-digit',year:'numeric'});
-        const hora=now.toLocaleTimeString('es-PE',{hour:'2-digit',minute:'2-digit'});
-        return `FECHA Y HORA: ${fecha} / ${hora}
-+++ SEGUIMIENTO TECNICO A365 +++
-TECNICO: ${v.tecnico}
-TELÉFONO: ${v.telefono}
-ID DE LLAMADA: ${v.id_llamada}
-OBSERVACION: ${v.observacion}
-REALIZADO POR: ${u}`;
-      }
-    },
-    {
-      id:'sd2', titulo:'CLIENTE CONFIRMA VISITA', subtitulo:'',
-      campos:[
-        {id:'tipo_servicio',  label:'Tipo de Servicio',      placeholder:'Ej: FTTH - Instalación'},
-        {id:'telefono',       label:'Teléfono',               placeholder:'Ej: 987654321'},
-        {id:'id_llamada',     label:'ID de Llamada',          placeholder:'Ej: 1788289232-339049'},
-        {id:'plano_coord',    label:'Plano / Coordenadas',    placeholder:'Ej: LMSB042 / -12.09,-77.03'},
-        {id:'fecha',   label:'Fecha de Visita',  tipo:'date'},
-        {id:'franja', label:'Franja',           tipo:'franja'},
-        {id:'observacion',    label:'Observación',            placeholder:'Detalle adicional'}
-      ],
-      template:(v,sot,u)=>{
-        const now=new Date();
-        const fecha=now.toLocaleDateString('es-PE',{day:'2-digit',month:'2-digit',year:'numeric'});
-        const hora=now.toLocaleTimeString('es-PE',{hour:'2-digit',minute:'2-digit'});
-        return `FECHA Y HORA: ${fecha} / ${hora}
-+++ MESA DE SEGUIMIENTO A365 +++
-TIPO DE SERVICIO: ${v.tipo_servicio}
-TELÉFONO: ${v.telefono}
-ID DE LLAMADA: ${v.id_llamada}
-PLANO / COORDENADAS: ${v.plano_coord}
-FECHA / FRANJA DE VISITA: ${v.fecha} / ${v.franja}
-OBSERVACION: ${v.observacion}
-REALIZADO POR: ${u}`;
-      }
-    },
-    {
-      id:'sd3', titulo:'CLIENTE NO CONTESTA', subtitulo:'',
-      campos:[
-        {id:'servicio',    label:'Servicio', tipo:'radio', opciones:['INSTALACION','POST VENTA','MANTENIMIENTO'], default:'INSTALACION'},
-        {id:'telefono',    label:'Teléfono',         placeholder:'Ej: 987654321'}
-      ],
-      template:(v,sot,u)=>{
-        const now=new Date();
-        const fecha=now.toLocaleDateString('es-PE',{day:'2-digit',month:'2-digit',year:'numeric'});
-        const hora=now.toLocaleTimeString('es-PE',{hour:'2-digit',minute:'2-digit'});
-        return `FECHA Y HORA: ${fecha} / ${hora}
-+++ MESA DE SEGUIMIENTO A365 +++
-CLIENTE NO CONTESTA
-SERVICIO: ${v.servicio}
-TELÉFONO: ${v.telefono}
-CANTIDAD DE LLAMADAS: 4 INTENTOS SIN RESULTADO, SE ENVIA WHATSAPP.
-REALIZADO POR: ${u}`;
-      }
-    },
-    {
-      id:'sd4', titulo:'CLIENTE NO DESEA ADELANTAR', subtitulo:'Mantiene fecha',
-      campos:[
-        {id:'servicio',     label:'Servicio',              placeholder:'Ej: FTTH - Instalación'},
-        {id:'telefono',     label:'Teléfono',               placeholder:'Ej: 987654321'},
-        {id:'fecha',   label:'Fecha de Visita',  tipo:'date'},
-        {id:'franja', label:'Franja',           tipo:'franja'},
-        {id:'id_llamada',   label:'ID de Llamada',          placeholder:'Ej: 1788289232-339049'}
-      ],
-      template:(v,sot,u)=>{
-        const now=new Date();
-        const fecha=now.toLocaleDateString('es-PE',{day:'2-digit',month:'2-digit',year:'numeric'});
-        const hora=now.toLocaleTimeString('es-PE',{hour:'2-digit',minute:'2-digit'});
-        return `FECHA Y HORA: ${fecha} / ${hora}
-+++ MESA DE SEGUIMIENTO A365 +++
-CLIENTE NO DESEA ADELANTAR - MANTIENE FECHA
-📧SERVICIO: ${v.servicio}
-TELÉFONO: ${v.telefono}
-📆FECHA / FRANJA DE VISITA: ${v.fecha} / ${v.franja}
-🪪ID DE LLAMADA: ${v.id_llamada}
-REALIZADO POR: ${u}`;
-      }
-    },
-    {
-      id:'sd5', titulo:'FUERA DE TOA', subtitulo:'SOT sin flujo TOA',
-      campos:[
-        {id:'sub_tipo',    label:'Sub Tipo',            placeholder:'Ej: INSTALACION'},
-        {id:'direccion',   label:'Dirección',           placeholder:'Ej: AV. LOS PINOS 123'},
-        {id:'distrito',    label:'Distrito',            placeholder:'Ej: SAN BORJA'},
-        {id:'servicio',    label:'Servicio',            placeholder:'Ej: FTTH - Instalación'},
-        {id:'plano',       label:'Plano',               placeholder:'Ej: LMSB042'},
-        {id:'cliente',     label:'Cliente',             placeholder:'Nombre completo'},
-        {id:'cod_cliente', label:'Cód. Cliente',        placeholder:'Ej: 4225215'},
-        {id:'celular',     label:'Celular del Cliente', placeholder:'Ej: 987654321'},
-        {id:'fecha',  label:'Fecha de Visita', tipo:'date'},
-        {id:'franja', label:'Franja',          tipo:'franja'}
-      ],
-      template:(v,sot,u)=>{
-        return `*FUERA DE TOA*
-🔍 SOT: ${sot}
-🍄 SUB TIPO: ${v.sub_tipo}
-🏡 DIRECCIÓN: ${v.direccion}
-🏡 DISTRITO: ${v.distrito}
-📧 SERVICIO: ${v.servicio}
-📝 PLANO: ${v.plano}
-👨💼 CLIENTE: ${v.cliente}
-👨‍💼💼 COD CLIENTE: ${v.cod_cliente}
-📱CELULAR DEL CLIENTE: ${v.celular}
-📍 FECHA Y FRANJA: ${v.fecha} / ${v.franja}
-✍️ REALIZADO POR:${u}
---------------------------------------------
-Proceder con atención fuera de TOA.
-Motivo: SOT sin flujo TOA
-Autorizado por: ${u}`;
-      }
-    },
-    {
-      id:'sd6', titulo:'LIBERACIÓN DE FRANJA', subtitulo:'',
-      campos:[
-        {id:'plano',       label:'Plano',               placeholder:'Ej: LAMO076-S'},
-        {id:'cliente',     label:'Cliente',             placeholder:'Nombre del cliente'},
-        {id:'tipo_trabajo',label:'Tipo de Trabajo',     placeholder:'Ej: FTTH - PORTABILIDAD'},
-        {id:'fecha',  label:'Fecha de Visita', tipo:'date'},
-        {id:'franja', label:'Franja',          tipo:'franja'}
-      ],
-      template:(v,sot,u)=>{
-        return `LIBERACION DE FRANJA
-SOT: ${sot}
-PLANO: ${v.plano}
-CLIENTE: ${v.cliente}
-TIPO DE TRABAJO: ${v.tipo_trabajo}
-FECHA / FRANJA: ${v.fecha} / ${v.franja}`;
-      }
-    },
-    {
-      id:'sd7', titulo:'ESPERA DE EQUIPOS', subtitulo:'Sin stock',
-      campos:[
-        {id:'modelo', label:'Modelo de Equipo', placeholder:'Ej: ONT HG8345R'}
-      ],
-      template:(v,sot,u)=>{
-        return `EN ESPERA DE EQUIPOS
-Sin Stock de equipos
-Modelo: ${v.modelo}
-Pendiente de Atención o reasignación
-REALIZADO POR: ${u}`;
-      }
-    },
-    {
-      id:'sd8', titulo:'TOA NO INTERVIENE', subtitulo:'Atención por sistemas',
-      campos:[],
-      template:(v,sot,u)=>{
-        return `+++ MESA DE SEGUIMIENTO A365 +++
-ATENCION POR SISTEMAS // NO CORRESPONDE VISITA EN CAMPO
-Revisado Por: ${u}`;
-      }
-    },
-    {
-      id:'sd9', titulo:'CENTRO COMERCIAL', subtitulo:'Coordinación de estado',
-      campos:[],
-      template:(v,sot,u)=>{
-        return `+++ MESA DE SEGUIMIENTO A365 +++
-ESTABLECIMIENTO EN CENTRO COMERCIAL
-SE CAMBIA ESTADO PARA COORDINACION
-REALIZADO POR: ${u}`;
-      }
-    }
-  ],
-  reprogramacion: [
-    {
-      id:'sr1', titulo:'REPROGRAMACIÓN DE VISITA', subtitulo:'Reprogramado en Mesa',
-      usaMotivo:true, usaContactabilidad:true,
-      campos:[
-        {id:'nombre_cliente', label:'Cliente',     placeholder:'Ej: JUAN PÉREZ QUISPE'},
-        {id:'telefono',       label:'Teléfono',    placeholder:'Ej: 987654321'},
-        {id:'id_llamada',     label:'ID de Llamada',    placeholder:'Ej: 1788289232-339049'},
-        {id:'fecha_nueva',    label:'Nueva Fecha', tipo:'date'},
-        {id:'franja',         label:'Franja',      tipo:'franja'},
-        {id:'contrata',       label:'Contrata',    placeholder:'Ej: VISANET'},
-        {id:'observacion',    label:'Observación', placeholder:'Ej: Cliente solicita horario de tarde'}
-      ],
-      template:(v,sot,u,motivo)=>
-`**MESA DE SEGUIMIENTO A365**
-REPROGRAMADO EN MESA
-NUEVA FECHA Y FRANJA DE VISITA: ${v.fecha_nueva} / ${v.franja}
-CLIENTE: ${v.nombre_cliente}
-TELÉFONO: ${v.telefono}
-MOTIVO DE REPROGRAMACIÓN: ${motivo}
-CONTRATA: ${v.contrata}
-REALIZADO POR: ${u}
-ID DE LLAMADA: ${v.id_llamada}
-OBSERVACION: ${v.observacion}`
-    },
-    {
-      id:'sr2', titulo:'REPROGRAMACIÓN POR INCIDENCIA', subtitulo:'Reprogramado en Campo',
-      usaMotivo:true, usaLaraigo:true, usaContactabilidad:true,
-      campos:[
-        {id:'nombre_cliente', label:'Cliente',     placeholder:'Ej: JUAN PÉREZ QUISPE'},
-        {id:'telefono',       label:'Teléfono',    placeholder:'Ej: 987654321'},
-        {id:'id_llamada',     label:'ID de Llamada',    placeholder:'Ej: 1788289232-339049'},
-        {id:'fecha_nueva',    label:'Nueva Fecha', tipo:'date'},
-        {id:'franja',         label:'Franja',      tipo:'franja'},
-        {id:'contrata',       label:'Contrata',    placeholder:'Ej: VISANET'},
-        {id:'observacion',    label:'Observación', placeholder:'Ej: Incidencia detectada en campo'}
-      ],
-      template:(v,sot,u,motivo)=>
-`**MESA DE SEGUIMIENTO A365**
-REPROGRAMADO EN CAMPO
-NUEVA FECHA Y FRANJA DE VISITA: ${v.fecha_nueva} / ${v.franja}
-CLIENTE: ${v.nombre_cliente}
-TELÉFONO: ${v.telefono}
-MOTIVO DE REPROGRAMACIÓN: ${motivo}
-CONTRATA: ${v.contrata}
-${v.lara||''}REALIZADO POR: ${u}
-ID DE LLAMADA: ${v.id_llamada}
-OBSERVACION: ${v.observacion}`
-    }
-  ],
-  rechazo: [
-    { id:'rc1', titulo:'RECHAZO EN LINEA', subtitulo:'Cliente no desea el servicio', tipoEspecial:'rc' },
-    { id:'rc2', titulo:'RECHAZO TECNICO', subtitulo:'Sin viabilidad técnica', tipoEspecial:'rc', usaLaraigo:true },
-    { id:'rc3', titulo:'CIERRE', subtitulo:'Cierre de caso en mesa', tipoEspecial:'cierre', usaLaraigo:true }
-  ]
-};
-
-function templateRC(id,v,sot,u,motivo,submotivo,servicio,tecnologia,idLlamada,paqueteIngresado,paqueteCorrecto){
-  const tag = id==='rc1' ? 'RECHAZADO EN MESA' : 'RECHAZADO EN CAMPO';
-  if(motivo === 'MALA OFERTA'){
-    return `**MESA DE SEGUIMIENTO A365**
-${tag} -- ${servicio} / ${tecnologia}
-PERSONA QUE CONTESTA: ${v.cliente}
-TELÉFONO: ${v.telefono}
-MOTIVO DEL RECHAZO: ${motivo}
-SUBMOTIVO DE RECHAZO: ${submotivo}
-MOTIVO DEL RECHAZO: MALA OFERTA
-SUBMOTIVO DE RECHAZO: ${submotivo}
-PAQUETE INGRESADO: ${paqueteIngresado}
-PAQUETE CORRECTO: ${paqueteCorrecto}
-${v.lara||''}REALIZADO POR: ${u}
-ID DE LLAMADA: ${idLlamada}`;
-  }
-  return `**MESA DE SEGUIMIENTO A365**
-${tag} -- ${servicio} / ${tecnologia}
-PERSONA QUE CONTESTA: ${v.cliente}
-TELÉFONO: ${v.telefono}
-MOTIVO DEL RECHAZO: ${motivo}
-SUBMOTIVO DE RECHAZO: ${submotivo}
-${v.lara||''}REALIZADO POR: ${u}
-ID DE LLAMADA: ${idLlamada}`;
-}
-
-function templateCierre(v,sot,u,motivo,submotivo,idLlamada){
-  const tipoCierre = motivo === 'EJECUTADO Y MOVILIZADO' ? 'CIERRE EN CAMPO' : 'CIERRE EN MESA';
-  return `**MESA DE SEGUIMIENTO A365**
-${tipoCierre}
-CLIENTE: ${v.cliente}
-MOTIVO: ${motivo}
-SUB MOTIVO: ${submotivo}
-TELÉFONO: ${v.telefono}
-CONTRATA: ${v.contrata}
-${v.lara||''}REALIZADO POR: ${u}
-ID DE LLAMADA: ${idLlamada}`;
-}
-
-/* ── Estado de plantillas ── */
-let categoria = 'dia';
-let plantillaActiva = null;
-
-const catTabs        = $('#catTabs');
-const plantillaSelect = $('#plantillaSelect');
-const plantillaHint   = $('#plantillaHint');
-const campoSOT        = $('#campoSOT');
-const motivoWrap      = $('#motivoWrap');
-const motivoTipo      = $('#motivoTipo');
-const motivoDetalle   = $('#motivoDetalle');
-const fieldsContainer = $('#fieldsContainer');
-const agentName       = $('#agentName');
-const output          = $('#output');
-const ticketLabel     = $('#ticketLabel');
-const ticketSot       = $('#ticketSot');
-
-function setupPlantillas(){
-  catTabs.addEventListener('click', e => {
-    const b = e.target.closest('.seg-btn'); if(!b) return;
-    categoria = b.dataset.cat;
-    $$('#catTabs .seg-btn').forEach(x => x.classList.toggle('is-active', x === b));
-    poblarSelectPlantillas();
-  });
-  plantillaSelect.addEventListener('change', () => seleccionarPlantilla(plantillaSelect.value));
-  motivoTipo.addEventListener('change', () => {
-    motivoDetalle.innerHTML = '<option value="">— Seleccionar —</option>';
-    (SEG_MOTIVOS[motivoTipo.value] || []).forEach(op => {
-      const o = document.createElement('option'); o.value = op; o.textContent = op;
-      motivoDetalle.appendChild(o);
-    });
-  });
-
-  $('#genBtn').addEventListener('click', generarTexto);
-  $('#copyBtn').addEventListener('click', copyOutput);
-  $('#clearBtn').addEventListener('click', clearOutput);
-}
-
-function poblarSelectPlantillas(){
-  const plants = SEG_PLANTILLAS[categoria] || [];
-  plantillaSelect.innerHTML = plants.map(p => `<option value="${p.id}">${p.titulo}</option>`).join('');
-  seleccionarPlantilla(plants[0] && plants[0].id);
-}
-
-function seleccionarPlantilla(id){
-  const plants = SEG_PLANTILLAS[categoria] || [];
-  plantillaActiva = plants.find(p => p.id === id) || null;
-  if(!plantillaActiva) return;
-
-  plantillaHint.textContent = plantillaActiva.subtitulo || '';
-  ticketLabel.textContent = plantillaActiva.titulo;
-
-  if(plantillaActiva.usaMotivo){
-    motivoWrap.hidden = false;
-    motivoTipo.value = '';
-    motivoDetalle.innerHTML = '<option value="">— Primero selecciona responsable —</option>';
-  } else {
-    motivoWrap.hidden = true;
-  }
-
-  fieldsContainer.innerHTML = '';
-
-  if(plantillaActiva.tipoEspecial === 'rc'){
-    renderCamposRC();
-  } else if(plantillaActiva.tipoEspecial === 'cierre'){
-    renderCamposCierre();
-  } else if(plantillaActiva.campos.length === 0){
-    fieldsContainer.innerHTML = `<div class="no-campos">✅ Solo completa el SOT y presiona <strong>Generar texto</strong>.</div>`;
-  } else {
-    const grid = document.createElement('div');
-    grid.className = 'grid-2';
-
-    if(plantillaActiva.usaContactabilidad){
-      const cont = document.createElement('div');
-      cont.className = 'field';
-      cont.innerHTML = `<label>Contactabilidad</label>
-        <div class="radio-group">
-          <label><input type="radio" name="reprog_contactabilidad" value="SI" checked onchange="toggleContactabilidadReprog()"> SI</label>
-          <label><input type="radio" name="reprog_contactabilidad" value="NO" onchange="toggleContactabilidadReprog()"> NO</label>
-        </div>`;
-      grid.appendChild(cont);
-    }
-    if(plantillaActiva.usaLaraigo){
-      const tmp = document.createElement('div'); tmp.innerHTML = laraigoHTML();
-      while(tmp.firstChild) grid.appendChild(tmp.firstChild);
-    }
-
-    plantillaActiva.campos.forEach(c => {
-      const div = document.createElement('div');
-      div.className = 'field';
-      if(c.id === 'id_llamada' && plantillaActiva.usaContactabilidad) div.id = 'reprog_id_llamada_wrap';
-      let inputHtml = '';
-      if(c.tipo === 'date'){
-        inputHtml = `<input type="date" id="campo_${c.id}">`;
-      } else if(c.tipo === 'franja'){
-        inputHtml = `<select id="campo_${c.id}">
-          <option value="">— Seleccionar —</option>
-          <option>AM0</option><option>AM1</option>
-          <option>PM1</option><option>PM3</option>
-        </select>`;
-      } else if(c.tipo === 'radio'){
-        div.className = 'field';
-        const opciones = c.opciones || [];
-        inputHtml = `<div class="radio-group">${opciones.map(op => {
-          const checked = op === (c.default || opciones[0]) ? ' checked' : '';
-          return `<label><input type="radio" name="campo_${c.id}" value="${op}"${checked}> ${op}</label>`;
-        }).join('')}</div>`;
-      } else {
-        inputHtml = `<input type="text" id="campo_${c.id}" placeholder="${c.placeholder||''}">`;
-      }
-      div.innerHTML = `<label>${c.label}</label>${inputHtml}`;
-      grid.appendChild(div);
-    });
-    fieldsContainer.appendChild(grid);
-  }
-
-  // Pegar texto TOA para autocompletar (plantilla FUERA DE TOA)
-  if(plantillaActiva.id === 'sd5'){
-    const box = document.createElement('div');
-    box.className = 'toa-box';
-    box.innerHTML = `
-      <label style="display:block;font-size:12px;color:var(--muted);margin:14px 0 6px;">Pegar texto de TOA (opcional)</label>
-      <p class="panel-hint" style="margin-bottom:8px;">En TOA abre la actividad, <b>Ctrl+A</b> y <b>Ctrl+C</b>. Pégalo aquí (<b>Ctrl+V</b>) y los campos (y el SOT) se completan solos.</p>
-      <textarea id="toaPasteInput" placeholder="Pega aquí el texto completo de la actividad…"></textarea>
-      <div class="toa-status" id="toaPasteStatus">esperando texto…</div>`;
-    fieldsContainer.insertBefore(box, fieldsContainer.firstChild);
-    $('#toaPasteInput').addEventListener('input', extraerYAutorrellenarTOA);
-  }
-}
-
-/* ── TOA paste → autofill ── */
-const TOA_KEYWORDS = {
-  sot: 'SOT', sub_tipo: 'Sub Tipo de Orden', direccion: 'Direccion', distrito: 'Distrito',
-  servicio: 'Tipo de Orden', plano: 'Plano', cliente: 'Nombre', cod_cliente: 'Código de Cliente',
-  celular: 'Telefono', fecha: 'Fecha de Programacion', franja: 'Ventana Entrega'
-};
-function extractTOAField(text, keyword){
-  if(!keyword) return '';
-  const padded = '\n' + text + '\n';
-  const marker = '\n' + keyword + '\n';
-  const idx = padded.indexOf(marker);
-  if(idx === -1) return '';
-  const start = idx + marker.length;
-  const end = padded.indexOf('\n', start);
-  if(end === -1) return '';
-  return padded.substring(start, end).trim();
-}
-function ddmmyyToISO(str){
-  const m = (str||'').trim().match(/^(\d{2})\/(\d{2})\/(\d{2,4})$/);
-  if(!m) return '';
-  let [, d, mo, y] = m;
-  if(y.length === 2) y = '20' + y;
-  return `${y}-${mo}-${d}`;
-}
-function extraerYAutorrellenarTOA(){
-  const text = $('#toaPasteInput').value;
-  const status = $('#toaPasteStatus');
-  if(!text.trim()){ status.textContent = 'esperando texto…'; status.className = 'toa-status'; return; }
-  let found = 0;
-  Object.keys(TOA_KEYWORDS).forEach(campoId => {
-    const val = extractTOAField(text, TOA_KEYWORDS[campoId]);
-    if(!val) return;
-    if(campoId === 'sot'){ campoSOT.value = val; found++; return; }
-    const el = $('#campo_'+campoId); if(!el) return;
-    if(el.tagName === 'INPUT' && el.type === 'date'){
-      const iso = ddmmyyToISO(val); if(iso){ el.value = iso; found++; }
-    } else if(el.tagName === 'SELECT'){
-      const match = [...el.options].find(o => o.value.toUpperCase() === val.toUpperCase());
-      if(match){ el.value = match.value; found++; }
-    } else { el.value = val; found++; }
-  });
-  if(found === 0){ status.textContent = 'no se detectaron campos, revisa el texto pegado'; status.className = 'toa-status'; }
-  else { status.textContent = `${found} campo(s) detectado(s) y completado(s)`; status.className = 'toa-status ok'; }
-}
-
-/* ── Laraigo / campos especiales ── */
-function laraigoHTML(){
-  return `<div class="field">
-      <label>Laraigo</label>
-      <div class="radio-group">
-        <label><input type="radio" name="laraigo" value="SI" onchange="toggleLaraigo()"> SI</label>
-        <label><input type="radio" name="laraigo" value="NO" checked onchange="toggleLaraigo()"> NO</label>
-      </div>
-    </div>
-    <div class="field" id="laraigo_ticket_wrap" hidden>
-      <label>Ticket Laraigo</label>
-      <input type="text" id="campo_ticket_laraigo" placeholder="Ej: 0085852" inputmode="numeric" autocomplete="off">
-    </div>`;
-}
-function toggleLaraigo(){
-  const val = $('input[name="laraigo"]:checked');
-  const wrap = $('#laraigo_ticket_wrap');
-  if(wrap) wrap.hidden = !(val && val.value === 'SI');
-}
-function toggleContactabilidadReprog(){
-  const val = $('input[name="reprog_contactabilidad"]:checked');
-  const wrap = $('#reprog_id_llamada_wrap');
-  if(wrap) wrap.style.display = (val && val.value === 'SI') ? '' : 'none';
-}
-function toggleIdLlamadaRC(){
-  const val = $('input[name="rc_contactabilidad"]:checked');
-  const wrap = $('#rc_id_llamada_wrap');
-  if(wrap) wrap.style.display = (val && val.value === 'SI') ? 'block' : 'none';
-}
-function actualizarSubmotivosRC(){
-  const m = $('#campo_motivo'), s = $('#campo_submotivo');
-  s.innerHTML = '<option value="">— Seleccionar —</option>';
-  if(m.value && RECHAZO_MOTIVOS[m.value]){
-    RECHAZO_MOTIVOS[m.value].forEach(sm => {
-      const o = document.createElement('option'); o.value = sm; o.textContent = sm; s.appendChild(o);
-    });
-  }
-}
-function togglePaquetesRC(){
-  const m = $('#campo_motivo');
-  const w = $('#rc_paquetes_wrap'); if(w) w.hidden = !(m && m.value === 'MALA OFERTA');
-}
-function toggleIdLlamadaCierre(){
-  const val = $('input[name="cierre_contactabilidad"]:checked');
-  const wrap = $('#cierre_id_llamada_wrap');
-  if(wrap) wrap.style.display = (val && val.value === 'SI') ? 'block' : 'none';
-}
-function actualizarSubmotivosCierre(){
-  const m = $('#campo_motivo'), s = $('#campo_submotivo');
-  s.innerHTML = '<option value="">— Seleccionar —</option>';
-  if(m.value && CIERRE_MOTIVOS[m.value]){
-    CIERRE_MOTIVOS[m.value].forEach(sm => {
-      const o = document.createElement('option'); o.value = sm; o.textContent = sm; s.appendChild(o);
-    });
-  }
-}
-function renderCamposRC(){
-  const motivoOpts = Object.keys(RECHAZO_MOTIVOS).map(m => `<option value="${m}">${m}</option>`).join('');
-  fieldsContainer.innerHTML = `
-    <div class="grid-2">
-      <div class="field"><label>Cliente</label><input type="text" id="campo_cliente" placeholder="Nombre del cliente"></div>
-      <div class="field"><label>Teléfono</label><input type="text" id="campo_telefono" placeholder="Ej: 987654321"></div>
-      <div class="field">
-        <label>Servicio</label>
-        <div class="radio-group">
-          <label><input type="radio" name="rc_servicio" value="INSTALACION" checked> INSTALACION</label>
-          <label><input type="radio" name="rc_servicio" value="POST VENTA"> POST VENTA</label>
-        </div>
-      </div>
-      <div class="field">
-        <label>Tecnología</label>
-        <div class="radio-group">
-          <label><input type="radio" name="rc_tecnologia" value="FTTH" checked> FTTH</label>
-          <label><input type="radio" name="rc_tecnologia" value="HFC"> HFC</label>
-        </div>
-      </div>
-      <div class="field">
-        <label>Contactabilidad</label>
-        <div class="radio-group">
-          <label><input type="radio" name="rc_contactabilidad" value="SI" checked onchange="toggleIdLlamadaRC()"> SI</label>
-          <label><input type="radio" name="rc_contactabilidad" value="NO" onchange="toggleIdLlamadaRC()"> NO</label>
-        </div>
-      </div>
-      <div class="field" id="rc_id_llamada_wrap"><label>ID de Llamada</label><input type="text" id="campo_id_llamada" placeholder="Ej: 1515151151551"></div>
-      ${plantillaActiva && plantillaActiva.usaLaraigo ? laraigoHTML() : ''}
-      <div class="field">
-        <label>Motivo</label>
-        <select id="campo_motivo" onchange="actualizarSubmotivosRC(); togglePaquetesRC();">
-          <option value="">— Seleccionar —</option>${motivoOpts}
-        </select>
-      </div>
-      <div class="field">
-        <label>Submotivo</label>
-        <select id="campo_submotivo"><option value="">— Primero selecciona un motivo —</option></select>
-      </div>
-      <div class="field" id="rc_paquetes_wrap" hidden>
-        <div class="grid-2" style="margin-top:0;">
-          <div><label>Paquete ingresado</label><input type="text" id="campo_paquete_ingresado" placeholder="Ej: 200 Mbps + 1 deco"></div>
-          <div><label>Paquete correcto</label><input type="text" id="campo_paquete_correcto" placeholder="Ej: 100 Mbps + 2 decos"></div>
-        </div>
-      </div>
-    </div>`;
-}
-function renderCamposCierre(){
-  const motivoOpts = Object.keys(CIERRE_MOTIVOS).map(m => `<option value="${m}">${m}</option>`).join('');
-  fieldsContainer.innerHTML = `
-    <div class="grid-2">
-      <div class="field"><label>Cliente</label><input type="text" id="campo_cliente" placeholder="Nombre del cliente"></div>
-      <div class="field"><label>Teléfono</label><input type="text" id="campo_telefono" placeholder="Ej: 987654321"></div>
-      <div class="field"><label>Contrata</label><input type="text" id="campo_contrata" placeholder="Ej: VISANET"></div>
-      <div class="field">
-        <label>Contactabilidad</label>
-        <div class="radio-group">
-          <label><input type="radio" name="cierre_contactabilidad" value="SI" checked onchange="toggleIdLlamadaCierre()"> SI</label>
-          <label><input type="radio" name="cierre_contactabilidad" value="NO" onchange="toggleIdLlamadaCierre()"> NO</label>
-        </div>
-      </div>
-      <div class="field" id="cierre_id_llamada_wrap"><label>ID de Llamada</label><input type="text" id="campo_id_llamada" placeholder="Ej: 1515151151551"></div>
-      ${plantillaActiva && plantillaActiva.usaLaraigo ? laraigoHTML() : ''}
-      <div class="field">
-        <label>Motivo</label>
-        <select id="campo_motivo" onchange="actualizarSubmotivosCierre();">
-          <option value="">— Seleccionar —</option>${motivoOpts}
-        </select>
-      </div>
-      <div class="field">
-        <label>Submotivo</label>
-        <select id="campo_submotivo"><option value="">— Primero selecciona un motivo —</option></select>
-      </div>
-    </div>`;
-}
-
-function isoToDDMMYYYY(iso){
-  const p = (iso||'').split('-'); if(p.length !== 3) return '';
-  return `${p[2]}/${p[1]}/${p[0]}`;
-}
-
-function generarTexto(){
-  if(!plantillaActiva) return;
-  const sot = campoSOT.value.trim();
-  let ok = true;
-  if(!sot){ markError(campoSOT); ok = false; }
-
-  let motivoFinal = '';
-  if(plantillaActiva.usaMotivo){
-    const mt = motivoTipo.value.trim(), md = motivoDetalle.value.trim();
-    if(!mt){ markError(motivoTipo); ok = false; }
-    if(!md){ markError(motivoDetalle); ok = false; }
-    if(mt && md) motivoFinal = md;
-  }
-
-  const u = agentName.value.trim() || '—';
-  let texto = '', telefonoLog = '', idLlamadaLog = '', servicioLog = '';
-
-  let laraTxt = '';
-  if(plantillaActiva.usaLaraigo){
-    const r = $('input[name="laraigo"]:checked');
-    const laraigoLog = r ? r.value : 'NO';
-    if(laraigoLog === 'SI'){
-      const tk = $('#campo_ticket_laraigo');
-      const ticket = tk.value.trim();
-      if(!ticket){ markError(tk); ok = false; }
-      else laraTxt = `TICKET: ${ticket}\n`;
-    }
-  }
-
-  if(plantillaActiva.tipoEspecial === 'rc'){
-    const cliente = $('#campo_cliente'), telefono = $('#campo_telefono'),
-          motivo = $('#campo_motivo'), submotivo = $('#campo_submotivo');
-    if(!cliente.value.trim()){ markError(cliente); ok=false; }
-    if(!telefono.value.trim()){ markError(telefono); ok=false; }
-    if(!motivo.value){ markError(motivo); ok=false; }
-    if(!submotivo.value){ markError(submotivo); ok=false; }
-    const contVal = $('input[name="rc_contactabilidad"]:checked');
-    let idLlamada = 'NO APLICA';
-    if(contVal && contVal.value === 'SI'){
-      const idEl = $('#campo_id_llamada');
-      if(!idEl.value.trim()){ markError(idEl); ok=false; } else idLlamada = idEl.value.trim();
-    }
-    let pi='', pc='';
-    if(motivo.value === 'MALA OFERTA'){
-      const a = $('#campo_paquete_ingresado'), b = $('#campo_paquete_correcto');
-      pi = a.value.trim(); pc = b.value.trim();
-      if(!pi){ markError(a); ok=false; } if(!pc){ markError(b); ok=false; }
-    }
-    if(!ok){ showToast('⚠️ Completa los campos requeridos','warn'); return; }
-    const servicio = $('input[name="rc_servicio"]:checked').value;
-    const tecnologia = $('input[name="rc_tecnologia"]:checked').value;
-    const valores = { cliente: cliente.value.trim(), telefono: telefono.value.trim(), lara: laraTxt };
-    texto = templateRC(plantillaActiva.id, valores, sot, u, motivo.value, submotivo.value, servicio, tecnologia, idLlamada, pi, pc);
-    telefonoLog = valores.telefono; idLlamadaLog = idLlamada; servicioLog = servicio;
-
-  } else if(plantillaActiva.tipoEspecial === 'cierre'){
-    const cliente = $('#campo_cliente'), telefono = $('#campo_telefono'),
-          contrata = $('#campo_contrata'), motivo = $('#campo_motivo'), submotivo = $('#campo_submotivo');
-    if(!cliente.value.trim()){ markError(cliente); ok=false; }
-    if(!telefono.value.trim()){ markError(telefono); ok=false; }
-    if(!contrata.value.trim()){ markError(contrata); ok=false; }
-    if(!motivo.value){ markError(motivo); ok=false; }
-    if(!submotivo.value){ markError(submotivo); ok=false; }
-    const contVal = $('input[name="cierre_contactabilidad"]:checked');
-    let idLlamada = 'NO APLICA';
-    if(contVal && contVal.value === 'SI'){
-      const idEl = $('#campo_id_llamada');
-      if(!idEl.value.trim()){ markError(idEl); ok=false; } else idLlamada = idEl.value.trim();
-    }
-    if(!ok){ showToast('⚠️ Completa los campos requeridos','warn'); return; }
-    const valores = { cliente: cliente.value.trim(), telefono: telefono.value.trim(), contrata: contrata.value.trim(), lara: laraTxt };
-    texto = templateCierre(valores, sot, u, motivo.value, submotivo.value, idLlamada);
-    telefonoLog = valores.telefono; idLlamadaLog = idLlamada;
-
-  } else {
-    let contactabilidadVal = null;
-    if(plantillaActiva.usaContactabilidad){
-      const c = $('input[name="reprog_contactabilidad"]:checked');
-      contactabilidadVal = c ? c.value : 'SI';
-    }
-    const valores = {};
-    plantillaActiva.campos.forEach(c => {
-      if(c.tipo === 'radio'){
-        const chk = $(`input[name="campo_${c.id}"]:checked`);
-        valores[c.id] = chk ? chk.value : ''; return;
-      }
-      const el = $('#campo_'+c.id); if(!el) return;
-      if(c.id === 'id_llamada' && contactabilidadVal === 'NO'){ valores.id_llamada = 'NO APLICA'; return; }
-      let val = el.value.trim();
-      if(c.tipo === 'date' && val) val = isoToDDMMYYYY(val);
-      if(!val){ markError(el); ok=false; } else valores[c.id] = val;
-    });
-    if(!ok){ showToast('⚠️ Completa los campos requeridos','warn'); return; }
-    valores.lara = laraTxt;
-    texto = plantillaActiva.template(valores, sot, u, motivoFinal);
-    telefonoLog = valores.telefono || ''; idLlamadaLog = valores.id_llamada || ''; servicioLog = valores.servicio || '';
-  }
-
-  output.textContent = texto;
-  ticketSot.textContent = 'SOT ' + (sot || '—');
-  $('#ticketShell').hidden = false;
-  $('#plantillasSplit').classList.remove('solo');
-  if(window.matchMedia('(max-width: 880px)').matches) $('#ticketShell').scrollIntoView({behavior:'smooth', block:'start'});
-  showToast('✓ Texto generado');
-}
-
-function copyOutput(){
-  const text = output.textContent;
-  if(!text){ showToast('⚠️ Primero genera el texto','warn'); return; }
-  const fb = () => {
-    const ta = document.createElement('textarea'); ta.value = text;
-    ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select();
-    try{ document.execCommand('copy'); }catch(e){} document.body.removeChild(ta);
-    showCopyFeedback();
+  const agent = $('#agent');
+  const defAgent = prof.user ? `${prof.user} - A365` : '';
+  agent.value = LS.get(k('agent'), defAgent);
+  const syncWho = () => {
+    const name = (agent.value || '').replace(/\s*-\s*A365\s*$/i, '').trim();
+    $('#whoName').textContent = prof.user || name || 'Sin nombre';
+    $('#whoTag').textContent = prof.label;
   };
-  if(navigator.clipboard && navigator.clipboard.writeText){
-    navigator.clipboard.writeText(text).then(showCopyFeedback).catch(fb);
-  } else fb();
-}
-function showCopyFeedback(){
-  const f = $('#copyFeedback'); f.style.display='inline'; setTimeout(()=>f.style.display='none',1600);
-}
-function clearOutput(){
-  output.textContent=''; ticketSot.textContent='SOT —'; $('#ticketShell').hidden = true; campoSOT.value='';
-  $('#plantillasSplit').classList.add('solo');
-  if(plantillaActiva) seleccionarPlantilla(plantillaActiva.id);
+  agent.addEventListener('input', () => { LS.set(k('agent'), agent.value); syncWho(); Gen.update(); });
+  syncWho();
+
+  setupTabs();
+  setupLinks();
+  setupPopovers();
+  Gen.init();
+  setupCoax();
+  Tables.init();
+  if(prof.features.includes('speech')) Speech.init();
+  $('#logoutBtn').addEventListener('click', endSession);
 }
 
-/* ════════════════════════════════════════════════════════════
-   MEDIDOR · HFC (coaxial) y FTTH (fibra)
-   ════════════════════════════════════════════════════════════ */
-function setupMedidor(){
-  // tabs coaxial / fibra
-  $$('#medidorTabs .seg-btn').forEach(b => b.addEventListener('click', () => {
-    const t = b.dataset.tech;
-    $$('#medidorTabs .seg-btn').forEach(x => x.classList.toggle('is-active', x === b));
-    $('#panel-hfc').classList.toggle('is-active', t === 'hfc');
-    $('#panel-ftth').classList.toggle('is-active', t === 'ftth');
-    $('#panel-hfc').hidden = t !== 'hfc';
-    $('#panel-ftth').hidden = t !== 'ftth';
+function setupTabs(){
+  const tabs = $$('#tabs .tab');
+  const show = v => {
+    tabs.forEach(t => t.classList.toggle('is-active', t.dataset.view === v));
+    $$('.view').forEach(s => s.classList.toggle('is-active', s.id === 'view-' + v));
+    LS.set(k('view'), v);
+  };
+  tabs.forEach(t => t.addEventListener('click', () => show(t.dataset.view)));
+  const last = LS.get(k('view'), 'plantillas');
+  const ok = tabs.find(t => t.dataset.view === last && !t.hidden);
+  show(ok ? last : 'plantillas');
+}
+
+/* ───────────────────────── Enlaces ───────────────────────── */
+function setupLinks(){
+  $('#quickLinks').innerHTML = LINKS.filter(l => l.quick)
+    .map(l => `<a class="qlink" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer" title="${esc(l.d)}">${esc(l.t)}</a>`).join('');
+  $('#linksGrid').innerHTML = LINKS
+    .map(l => `<a href="${esc(l.url)}" target="_blank" rel="noopener noreferrer"><b>${esc(l.t)}</b><span>${esc(l.d)}</span></a>`).join('');
+}
+
+/* ───────────────────────── Popovers (enlaces, FTTH) ───────────────────────── */
+function setupPopovers(){
+  const pairs = [['allLinksBtn','linksPop'], ['ftthBtn','ftthPop']];
+  let ftthT = null;
+  const close = id => {
+    const pop = $('#' + id); if(!pop || pop.hidden) return;
+    pop.hidden = true;
+    const b = pairs.find(p => p[1] === id); if(b) $('#' + b[0]).setAttribute('aria-expanded', 'false');
+    if(id === 'ftthPop') clearTimeout(ftthT);
+  };
+  const open = id => {
+    pairs.forEach(p => { if(p[1] !== id) close(p[1]); });
+    const pop = $('#' + id); pop.hidden = false;
+    const b = pairs.find(p => p[1] === id); $('#' + b[0]).setAttribute('aria-expanded', 'true');
+    if(id === 'ftthPop'){
+      const bar = $('#ftthTimer'); bar.classList.remove('run'); void bar.offsetWidth; bar.classList.add('run');
+      clearTimeout(ftthT); ftthT = setTimeout(() => close('ftthPop'), 10000);
+    }
+  };
+  pairs.forEach(([b, p]) => $('#' + b).addEventListener('click', e => {
+    e.stopPropagation();
+    $('#' + p).hidden ? open(p) : close(p);
   }));
+  $$('[data-close]').forEach(x => x.addEventListener('click', () => close(x.dataset.close)));
+  document.addEventListener('click', e => {
+    pairs.forEach(([, p]) => { const pop = $('#' + p); if(!pop.hidden && !pop.contains(e.target)) close(p); });
+  });
+  document.addEventListener('keydown', e => {
+    if(e.key === 'Escape'){ pairs.forEach(([, p]) => close(p)); if(window.Speech) Speech.close(); }
+  });
+}
 
-  // HFC
-  const hfcInput = $('#hfc-input'), hfcThreshold = $('#hfc-threshold');
-  const hfcUsnr = $('#hfc-usnr'), hfcUspow = $('#hfc-uspow');
-  function evalChip(inputEl, chipEl, passFn, passLabel, failLabel){
-    const raw = inputEl.value;
-    if(raw === ''){ chipEl.className='chip'; chipEl.textContent='—'; return null; }
-    const val = parseFloat(raw);
-    if(isNaN(val)){ chipEl.className='chip'; chipEl.textContent='—'; return null; }
-    const pass = passFn(val);
-    chipEl.className = 'chip ' + (pass ? 'ok' : 'bad');
-    chipEl.textContent = pass ? passLabel : failLabel;
-    return pass;
-  }
-  function parseHFC(raw){
-    if(!raw) return [];
-    return raw.split(/[,\n;]+/).map(s=>s.trim()).filter(s=>s.length>0)
-      .map(s=>parseFloat(s.replace(',','.'))).filter(n=>!isNaN(n));
-  }
-  function drawSpark(values){
-    const svg = $('#hfc-spark'); svg.innerHTML='';
-    if(values.length < 2){
-      if(values.length === 1){ svg.innerHTML = '<circle cx="150" cy="35" r="3.5" fill="var(--hfc)"></circle>'; }
+/* ════════════════════════════════════════════════════════════
+   GENERADOR · el texto se arma solo con cada cambio
+   ════════════════════════════════════════════════════════════ */
+const MK_L = '\u27E6', MK_R = '\u27E7';
+const marker = label => MK_L + label.toUpperCase() + MK_R;
+const isoToDMY = iso => { const p = (iso || '').split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0]}` : ''; };
+const dmyToISO = s => { const m = (s || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{2,4})$/); if(!m) return ''; let [, d, mo, y] = m; if(y.length === 2) y = '20' + y; return `${y}-${mo}-${d}`; };
+
+function horizontal(text, sep){
+  return text.split('\n')
+    .map(l => l.replace(/\s+/g, ' ').trim())
+    .filter(l => l && !/^[-=_*·.]{4,}$/.test(l))
+    .join(sep);
+}
+
+const Gen = {
+  st:null,
+  armed:false, armT:null,
+  lastMissing:[],
+
+  init(){
+    const saved = LS.get(k('form'), null);
+    this.st = Object.assign({ cat:'seguimiento', tpl:'sd1', sot:'', mode:'tab', sep:' | ', vals:{}, lastByCat:{} }, saved || {});
+    if(!TEMPLATES.find(t => t.id === this.st.tpl)) this.st.tpl = 'sd1';
+    this.save = debounce(() => LS.set(k('form'), this.st), 120);
+
+    this.renderCats();
+    $('#cats').addEventListener('click', e => {
+      const b = e.target.closest('button'); if(!b) return;
+      this.st.cat = b.dataset.cat;
+      const first = TEMPLATES.find(t => t.cat === this.st.cat);
+      this.select(this.st.lastByCat[this.st.cat] || first.id);
+    });
+    $('#tplList').addEventListener('click', e => {
+      const b = e.target.closest('.tpl'); if(b) this.select(b.dataset.id);
+    });
+
+    const sot = $('#sot');
+    sot.value = this.st.sot;
+    sot.addEventListener('input', () => { this.st.sot = sot.value; this.save(); this.update(); });
+
+    $$('#modeSeg button').forEach(b => b.addEventListener('click', () => { this.st.mode = b.dataset.mode; this.save(); this.syncMode(); this.update(); }));
+    const sep = $('#sepSel'); sep.value = this.st.sep;
+    sep.addEventListener('change', () => { this.st.sep = sep.value; this.save(); this.update(); });
+
+    $('#copyBtn').addEventListener('click', () => this.copy());
+    $('#newCaseBtn').addEventListener('click', () => this.newCase());
+    $('#toaInput').addEventListener('input', e => this.fromTOA(e.target.value));
+    document.addEventListener('keydown', e => {
+      if((e.ctrlKey || e.metaKey) && e.key === 'Enter' && $('#view-plantillas').classList.contains('is-active')){ e.preventDefault(); this.copy(); }
+    });
+    $('#genStatus').addEventListener('click', e => {
+      const b = e.target.closest('button[data-focus]'); if(!b) return;
+      const id = b.dataset.focus;
+      const el = id === 'sot' ? $('#sot') : id === 'agent' ? $('#agent') : ($('#f_' + id) || $(`[data-fid="${id}"] button`));
+      if(el){ el.focus(); el.scrollIntoView({ block:'center', behavior:'smooth' }); }
+    });
+
+    this.syncMode();
+    this.select(this.st.tpl, true);
+    setInterval(() => this.update(), 20000);   // fecha y hora al minuto
+  },
+
+  tpl(){ return TEMPLATES.find(t => t.id === this.st.tpl); },
+  norm(spec){ return typeof spec === 'string' ? { id:spec } : spec; },
+  raw(id){
+    const v = this.st.vals[id];
+    if(v !== undefined && v !== null && v !== '') return v;
+    return FIELDS[id] && FIELDS[id].def !== undefined ? FIELDS[id].def : '';
+  },
+  rawAll(){ const r = {}; Object.keys(FIELDS).forEach(id => r[id] = this.raw(id)); return r; },
+  optionsFor(f){
+    if(f.options) return f.options;
+    if(f.from){ return f.from.map[this.raw(f.from.field)] || []; }
+    return [];
+  },
+
+  renderCats(){
+    $('#cats').innerHTML = CATEGORIES.map(c => {
+      const n = TEMPLATES.filter(t => t.cat === c.id).length;
+      return `<button type="button" role="tab" data-cat="${c.id}">${esc(c.label)}<b>${n}</b></button>`;
+    }).join('');
+  },
+
+  select(id, initial){
+    const t = TEMPLATES.find(x => x.id === id) || TEMPLATES[0];
+    this.st.tpl = t.id; this.st.cat = t.cat; this.st.lastByCat[t.cat] = t.id;
+    this.save();
+    $$('#cats button').forEach(b => { const on = b.dataset.cat === t.cat; b.classList.toggle('is-on', on); b.setAttribute('aria-selected', on); });
+    const list = TEMPLATES.filter(x => x.cat === t.cat);
+    $('#tplList').innerHTML = list.map((x, i) => `
+      <button type="button" class="tpl${x.id === t.id ? ' is-on' : ''}" data-id="${x.id}" role="option" aria-selected="${x.id === t.id}">
+        <small>${pad2(i + 1)}</small><span>${esc(x.title)}</span>${x.note ? `<em>${esc(x.note)}</em>` : ''}
+      </button>`).join('');
+    $('#toaBox').hidden = !t.toa;
+    if(!t.toa){ $('#toaInput').value = ''; $('#toaStatus').textContent = 'esperando texto'; $('#toaStatus').className = 'toa-status'; }
+    $('#genTitle').textContent = t.title;
+    this.renderFields();
+    this.update();
+    if(!initial) this.disarm();
+  },
+
+  renderFields(){
+    const t = this.tpl(), box = $('#fields');
+    if(!t.fields.length){
+      box.innerHTML = `<div class="empty-fields">Esta plantilla solo necesita el SOT y “Realizado por”.</div>`;
       return;
     }
-    const max = Math.max(...values), min = Math.min(...values), span = (max-min)||1;
-    const w=300, h=70, pad=6;
-    const pts = values.map((v,i)=>{
-      const x = pad + (i/(values.length-1))*(w-pad*2);
-      const y = h-pad-((v-min)/span)*(h-pad*2);
-      return [x,y];
-    });
-    const pathD = pts.map((p,i)=>(i===0?'M':'L')+p[0].toFixed(1)+' '+p[1].toFixed(1)).join(' ');
-    const areaD = pathD+` L ${pts[pts.length-1][0].toFixed(1)} ${h} L ${pts[0][0].toFixed(1)} ${h} Z`;
-    const ns='http://www.w3.org/2000/svg';
-    const area=document.createElementNS(ns,'path'); area.setAttribute('d',areaD);
-    area.setAttribute('fill','var(--hfc)'); area.setAttribute('opacity','.14'); svg.appendChild(area);
-    const line=document.createElementNS(ns,'path'); line.setAttribute('d',pathD);
-    line.setAttribute('fill','none'); line.setAttribute('stroke','var(--hfc)'); line.setAttribute('stroke-width','2');
-    line.setAttribute('stroke-linecap','round'); line.setAttribute('stroke-linejoin','round'); svg.appendChild(line);
-    pts.forEach(p=>{ const c=document.createElementNS(ns,'circle'); c.setAttribute('cx',p[0]); c.setAttribute('cy',p[1]); c.setAttribute('r','2.2'); c.setAttribute('fill','var(--hfc)'); svg.appendChild(c); });
-  }
-  function computeHFC(){
-    const values = parseHFC(hfcInput.value);
-    const threshold = parseFloat(hfcThreshold.value) || 0;
-    const countEl = $('#hfc-count'); countEl.textContent = values.length;
-    const usnrPass = evalChip(hfcUsnr, $('#hfc-usnr-chip'), v=>v>28, 'OK', 'BAJO');
-    const uspowPass = evalChip(hfcUspow, $('#hfc-uspow-chip'), v=>v>=36.1 && v<=52.9, 'OK', 'FUERA DE RANGO');
-    const extraChecks = [usnrPass, uspowPass].filter(p=>p!==null);
-    const extraFail = extraChecks.some(p=>p===false);
-    const extraNotes = [];
-    if(usnrPass === false) extraNotes.push('U/S SNR bajo el mínimo (28 dB)');
-    if(uspowPass === false) extraNotes.push('Potencia Upstream fuera de 36.1–52.9 dBmV');
-
-    if(values.length === 0){
-      $('#hfc-max').innerHTML='—<i>dB</i>'; $('#hfc-min').innerHTML='—<i>dB</i>'; $('#hfc-diff').innerHTML='—<i>dB</i>';
-      drawSpark([]);
-      const light=$('#hfc-light'), verdict=$('#hfc-verdict'), detail=$('#hfc-detail');
-      if(extraChecks.length === 0){
-        light.className='status-dot'; verdict.className='verdict'; verdict.textContent='Esperando valores…';
-        detail.textContent='Pega una lista de lecturas para evaluar la estabilidad de la señal.';
-      } else {
-        light.className='status-dot '+(extraFail?'bad':'ok'); verdict.className='verdict '+(extraFail?'bad':'ok');
-        verdict.textContent = (extraFail?'❌  ':'✅  ')+'Mediciones '+(extraFail?'fuera de especificación':'dentro de especificación');
-        detail.textContent = extraFail ? extraNotes.join(' · ') : 'U/S SNR y Potencia Upstream dentro de rango.';
+    box.innerHTML = t.fields.map(spec => {
+      const { id } = this.norm(spec), f = FIELDS[id], val = this.raw(id);
+      const wide = f.wide || f.type === 'area' ? ' wide' : '';
+      let ctl = '';
+      if(f.type === 'seg'){
+        ctl = `<div class="seg" role="radiogroup" aria-labelledby="l_${id}">${f.options.map(o =>
+          `<button type="button" role="radio" data-v="${esc(o)}" aria-checked="${o === val}" class="${o === val ? 'is-on' : ''}">${esc(o)}</button>`).join('')}</div>`;
+        return `<div class="f${wide}" data-fid="${id}"><span class="lbl" id="l_${id}">${esc(f.label)}</span>${ctl}</div>`;
       }
+      if(f.type === 'select'){
+        ctl = `<select id="f_${id}"></select>`;
+      } else if(f.type === 'area'){
+        ctl = `<textarea id="f_${id}" rows="2" placeholder="${esc(f.ph || '')}">${esc(val)}</textarea>`;
+      } else if(f.type === 'date'){
+        ctl = `<input type="date" id="f_${id}" value="${esc(val)}">`;
+      } else {
+        ctl = `<input type="text" id="f_${id}" value="${esc(val)}" placeholder="${esc(f.ph || '')}" autocomplete="off"${f.mode ? ` inputmode="${f.mode}"` : ''}>`;
+      }
+      return `<div class="f${wide}" data-fid="${id}"><label class="lbl" for="f_${id}">${esc(f.label)}</label>${ctl}</div>`;
+    }).join('');
+
+    t.fields.forEach(spec => {
+      const { id } = this.norm(spec), f = FIELDS[id];
+      const wrap = $(`[data-fid="${id}"]`, box);
+      if(f.type === 'seg'){
+        wrap.addEventListener('click', e => {
+          const b = e.target.closest('button[data-v]'); if(!b) return;
+          this.set(id, b.dataset.v);
+          $$('button', wrap).forEach(x => { const on = x === b; x.classList.toggle('is-on', on); x.setAttribute('aria-checked', on); });
+        });
+      } else {
+        const el = $('#f_' + id);
+        el.addEventListener(f.type === 'select' || f.type === 'date' ? 'change' : 'input', () => this.set(id, el.value));
+        if(f.type === 'date') el.addEventListener('input', () => this.set(id, el.value));
+      }
+    });
+    this.refreshDynamic();
+  },
+
+  /* Visibilidad condicional y listas dependientes */
+  refreshDynamic(){
+    const t = this.tpl(), r = this.rawAll();
+    t.fields.forEach(spec => {
+      const s = this.norm(spec), f = FIELDS[s.id];
+      const wrap = $(`[data-fid="${s.id}"]`);
+      if(!wrap) return;
+      wrap.hidden = !!(s.when && !s.when(r));
+      if(f.type === 'select'){
+        const el = $('#f_' + s.id), opts = this.optionsFor(f), cur = this.raw(s.id);
+        const sig = opts.join('\u0001');
+        if(el.dataset.sig !== sig){
+          const parentLabel = f.from ? FIELDS[f.from.field].label.toLowerCase() : '';
+          el.innerHTML = (opts.length ? `<option value="">— Seleccionar —</option>` : `<option value="">— Primero elige ${esc(parentLabel)} —</option>`)
+            + opts.map(o => `<option value="${esc(o)}">${esc(o)}</option>`).join('');
+          el.disabled = !opts.length;
+          el.dataset.sig = sig;
+        }
+        if(cur && !opts.includes(cur)){ this.st.vals[s.id] = ''; }
+        el.value = opts.includes(cur) ? cur : '';
+      }
+    });
+  },
+
+  set(id, value){
+    this.st.vals[id] = value;
+    this.save();
+    this.refreshDynamic();
+    this.update();
+  },
+
+  build(){
+    const t = this.tpl(), r = this.rawAll(), v = {}, missing = [];
+    t.fields.forEach(spec => {
+      const s = this.norm(spec), f = FIELDS[s.id];
+      if(s.when && !s.when(r)){ v[s.id] = s.otherwise || ''; return; }
+      let val = String(r[s.id] || '').trim();
+      if(f.type === 'date') val = isoToDMY(val);
+      if(f.type === 'select' && !this.optionsFor(f).includes(val)) val = '';
+      if(!val){ v[s.id] = marker(f.label); missing.push({ id:s.id, label:f.label }); }
+      else v[s.id] = val;
+    });
+    const now = new Date();
+    const sot = (this.st.sot || '').trim();
+    const agent = ($('#agent').value || '').trim();
+    let usesAgent = false;
+    const ctx = {
+      fecha: now.toLocaleDateString('es-PE', { day:'2-digit', month:'2-digit', year:'numeric' }),
+      hora:  now.toLocaleTimeString('es-PE', { hour:'2-digit', minute:'2-digit' }),
+      sot:   sot || marker('SOT'),
+      get u(){ usesAgent = true; return agent || marker('Realizado por'); }
+    };
+    const text = t.render(v, ctx);
+    if(!sot) missing.unshift({ id:'sot', label:'SOT' });
+    if(usesAgent && !agent) missing.push({ id:'agent', label:'Realizado por' });
+    return { text, missing, total: t.fields.filter(s => { const n = this.norm(s); return !(n.when && !n.when(r)); }).length + 1 + (usesAgent ? 1 : 0) };
+  },
+
+  output(){ const b = this.build(); return Object.assign(b, { shown: this.st.mode === 'hz' ? horizontal(b.text, this.st.sep) : b.text }); },
+
+  update(){
+    if(!this.st) return;
+    const { shown, missing, total } = this.output();
+    this.lastMissing = missing;
+    const out = $('#out');
+    out.classList.toggle('hz', this.st.mode === 'hz');
+    out.innerHTML = esc(shown).replace(new RegExp(MK_L + '([^' + MK_R + ']*)' + MK_R, 'g'), '<mark>$1</mark>');
+    $('#genSot').textContent = 'SOT ' + ((this.st.sot || '').trim() || '—');
+    $('#fillMeta').textContent = `${total - missing.length} / ${total} campos`;
+    const status = $('#genStatus');
+    if(!missing.length){
+      status.innerHTML = `<span class="ok">Listo para copiar</span> · ${shown.length} caracteres`;
+      this.disarm();
+    } else {
+      status.innerHTML = `Falta: ` + missing.slice(0, 4).map(m => `<button type="button" data-focus="${m.id}">${esc(m.label)}</button>`).join(', ')
+        + (missing.length > 4 ? ` y ${missing.length - 4} más` : '');
+    }
+  },
+
+  syncMode(){
+    $$('#modeSeg button').forEach(b => { const on = b.dataset.mode === this.st.mode; b.classList.toggle('is-on', on); b.setAttribute('aria-checked', on); });
+    $('#sepWrap').hidden = this.st.mode !== 'hz';
+  },
+
+  disarm(){ this.armed = false; clearTimeout(this.armT); const b = $('#copyBtn'); b.classList.remove('force'); b.textContent = 'Copiar texto'; },
+
+  copy(){
+    const { shown, missing } = this.output();
+    if(missing.length && !this.armed){
+      missing.forEach(m => {
+        const el = m.id === 'sot' ? $('#sot') : m.id === 'agent' ? $('#agent') : ($('#f_' + m.id) || $(`[data-fid="${m.id}"] .seg`));
+        if(el){ el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash'); }
+      });
+      this.armed = true;
+      const b = $('#copyBtn'); b.classList.add('force'); b.textContent = 'Copiar igual';
+      clearTimeout(this.armT); this.armT = setTimeout(() => this.disarm(), 4000);
+      toast(`Faltan ${missing.length} campo(s). Pulsa otra vez para copiar igual.`, { warn:true, ms:3000 });
       return;
     }
-    const max=Math.max(...values), min=Math.min(...values), diff=max-min;
-    $('#hfc-max').innerHTML=max.toFixed(2)+'<i>dB</i>'; $('#hfc-min').innerHTML=min.toFixed(2)+'<i>dB</i>';
-    $('#hfc-diff').innerHTML=diff.toFixed(2)+'<i>dB</i>';
-    const stable = diff <= threshold, overallOk = stable && !extraFail;
-    const light=$('#hfc-light'), verdict=$('#hfc-verdict'), detail=$('#hfc-detail');
-    light.className='status-dot '+(overallOk?'ok':'bad');
-    verdict.className='verdict '+(overallOk?'ok':'bad');
-    verdict.textContent = (overallOk?'✅  ':'❌  ')+'Diferencia: '+diff.toFixed(2)+' dB → SEÑAL '+(stable?'ESTABLE':'INESTABLE');
-    const notes=[ stable ? 'variación dentro del umbral de '+threshold.toFixed(1)+' dB' : 'variación supera el umbral de '+threshold.toFixed(1)+' dB' ];
-    notes.push(...extraNotes);
-    detail.textContent = notes.join(' · ');
-    drawSpark(values);
-  }
-  hfcInput.addEventListener('input', computeHFC);
-  hfcThreshold.addEventListener('input', computeHFC);
-  hfcUsnr.addEventListener('input', computeHFC);
-  hfcUspow.addEventListener('input', computeHFC);
-  $('#hfc-clear').addEventListener('click', ()=>{ hfcInput.value=''; hfcUsnr.value=''; hfcUspow.value=''; computeHFC(); });
+    copyText(shown.replace(new RegExp('[' + MK_L + MK_R + ']', 'g'), ''));
+    const out = $('#out'); out.classList.remove('copied'); void out.offsetWidth; out.classList.add('copied');
+    this.disarm();
+    toast(this.st.mode === 'hz' ? 'Copiado en una línea' : 'Copiado');
+  },
 
-  // FTTH
-  const ftthLevel=$('#ftth-level'), ftthFrom=$('#ftth-from'), ftthTo=$('#ftth-to'), ftthMargin=$('#ftth-margin');
-  const LED_COUNT=22; const ledBar=$('#ftth-led-bar');
-  for(let i=0;i<LED_COUNT;i++){ const s=document.createElement('div'); s.className='led-seg'; ledBar.appendChild(s); }
-  const ledSegs=ledBar.querySelectorAll('.led-seg');
-  function computeFTTH(){
-    const level=parseFloat(ftthLevel.value), from=parseFloat(ftthFrom.value),
-          to=parseFloat(ftthTo.value), margin=parseFloat(ftthMargin.value)||0;
-    $('#ftth-weak-label').textContent=to.toFixed(2)+' dBm · débil';
-    $('#ftth-strong-label').textContent=from.toFixed(2)+' dBm · fuerte';
-    const light=$('#ftth-light'), verdict=$('#ftth-verdict'), detail=$('#ftth-detail'), posLabel=$('#ftth-pos');
-    if(isNaN(level)){
-      light.className='status-dot'; verdict.className='verdict'; verdict.textContent='Ingresa un nivel para evaluar'; detail.textContent='';
-      posLabel.textContent='Posición en el rango: —'; ledSegs.forEach(s=>s.className='led-seg'); return;
+  newCase(){
+    const snap = { sot:this.st.sot, vals:Object.assign({}, this.st.vals) };
+    this.st.sot = ''; this.st.vals = {};
+    $('#sot').value = '';
+    $('#toaInput').value = '';
+    this.save(); this.renderFields(); this.update();
+    $('#sot').focus();
+    toast('Caso limpiado', { ms:5000, action:{ label:'Deshacer', run:() => {
+      this.st.sot = snap.sot; this.st.vals = snap.vals; $('#sot').value = snap.sot;
+      this.save(); this.renderFields(); this.update();
+    }}});
+  },
+
+  fromTOA(text){
+    const st = $('#toaStatus');
+    if(!text.trim()){ st.textContent = 'esperando texto'; st.className = 'toa-status'; return; }
+    const padded = '\n' + text.replace(/\r/g, '') + '\n';
+    const grab = kw => {
+      const mk = '\n' + kw + '\n', i = padded.indexOf(mk); if(i === -1) return '';
+      const s = i + mk.length, e = padded.indexOf('\n', s); return e === -1 ? '' : padded.slice(s, e).trim();
+    };
+    let n = 0;
+    Object.entries(TOA_KEYWORDS).forEach(([id, kw]) => {
+      let val = grab(kw); if(!val) return;
+      if(id === 'sot'){ this.st.sot = val; $('#sot').value = val; n++; return; }
+      const f = FIELDS[id];
+      if(f.type === 'date'){ val = dmyToISO(val); if(!val) return; }
+      if(f.type === 'seg'){ const m = f.options.find(o => o.toUpperCase() === val.toUpperCase()); if(!m) return; val = m; }
+      this.st.vals[id] = val; n++;
+    });
+    this.save(); this.renderFields(); this.update();
+    st.textContent = n ? `${n} campo(s) completados desde TOA` : 'no se detectaron campos; revisa el texto pegado';
+    st.className = 'toa-status' + (n ? ' ok' : '');
+  }
+};
+
+/* ════════════════════════════════════════════════════════════
+   COAXIAL · medidor libre, sin SOT
+   ════════════════════════════════════════════════════════════ */
+function setupCoax(){
+  const inp = $('#coaxIn'), thr = $('#coaxThr'), usnr = $('#coaxUsnr'), pow = $('#coaxPow');
+  const saved = LS.get(k('coax'), {});
+  inp.value = saved.in || ''; thr.value = saved.thr || '4'; usnr.value = saved.usnr || ''; pow.value = saved.pow || '';
+  const save = debounce(() => LS.set(k('coax'), { in:inp.value, thr:thr.value, usnr:usnr.value, pow:pow.value }), 150);
+
+  const chip = (el, val, pass, okL, badL) => {
+    if(val === null){ el.className = 'chip'; el.textContent = '—'; return null; }
+    el.className = 'chip ' + (pass ? 'ok' : 'bad'); el.textContent = pass ? okL : badL; return pass;
+  };
+  const num = el => { const n = parseFloat(String(el.value).replace(',', '.')); return isNaN(n) ? null : n; };
+
+  function spark(vals){
+    const svg = $('#cSpark');
+    if(vals.length < 2){ svg.innerHTML = ''; return; }
+    const max = Math.max(...vals), min = Math.min(...vals), span = (max - min) || 1, w = 200, h = 40, p = 4;
+    const pts = vals.map((v, i) => [p + i / (vals.length - 1) * (w - 2 * p), h - p - (v - min) / span * (h - 2 * p)]);
+    const d = pts.map((q, i) => (i ? 'L' : 'M') + q[0].toFixed(1) + ' ' + q[1].toFixed(1)).join(' ');
+    svg.innerHTML = `<path d="${d} L ${pts[pts.length-1][0].toFixed(1)} ${h} L ${pts[0][0].toFixed(1)} ${h} Z" fill="rgba(43,255,136,.12)"/>`
+      + `<path d="${d}" fill="none" stroke="#2bff88" stroke-width="1.6" vector-effect="non-scaling-stroke"/>`;
+  }
+
+  function run(){
+    save();
+    const vals = inp.value.split(/[\s,;]+/).map(s => parseFloat(s)).filter(n => !isNaN(n));
+    const t = parseFloat(thr.value) || 0;
+    const u = num(usnr), pw = num(pow);
+    const uOk = chip($('#usnrChip'), u, u !== null && u > 28, 'OK', 'BAJO');
+    const pOk = chip($('#powChip'), pw, pw !== null && pw >= 36.1 && pw <= 52.9, 'OK', 'FUERA');
+    $('#cN').textContent = vals.length;
+    const notes = [];
+    if(uOk === false) notes.push('U/S SNR bajo 28 dB');
+    if(pOk === false) notes.push('Upstream fuera de 36.1–52.9 dBmV');
+    const verdict = $('#cVerdict'), vt = $('.v-text', verdict);
+
+    if(!vals.length){
+      ['#cMax','#cMin','#cDiff'].forEach(s => $(s).textContent = '—'); spark([]);
+      if(uOk === null && pOk === null){ verdict.className = 'verdict'; vt.textContent = 'Esperando lecturas'; return; }
+      const bad = uOk === false || pOk === false;
+      verdict.className = 'verdict ' + (bad ? 'bad' : 'ok');
+      vt.textContent = bad ? 'Fuera de especificación · ' + notes.join(' · ') : 'U/S SNR y Upstream dentro de rango';
+      return;
     }
-    let estado = (level>from || level<to) ? 'NO ACEPTABLE' : (level>=from-margin || level<=to+margin) ? 'ACEPTABLE' : 'ÓPTIMO';
-    let pos = ((level-to)/(from-to))*100; pos=Math.max(0,Math.min(100,pos));
-    const cls = estado==='ÓPTIMO'?'ok':(estado==='ACEPTABLE'?'warn':'bad');
-    const icon = estado==='ÓPTIMO'?'✅':(estado==='ACEPTABLE'?'⚠️':'❌');
-    light.className='status-dot '+cls; verdict.className='verdict '+cls;
-    verdict.textContent=icon+'  El nivel es '+estado;
-    detail.textContent='Nivel: '+level.toFixed(2)+' dBm · Estado: '+estado+' · Posición: '+Math.round(pos)+'%';
-    posLabel.textContent='Posición en el rango: '+Math.round(pos)+'%';
-    const litCount=Math.round((pos/100)*LED_COUNT);
-    ledSegs.forEach((seg,i)=>{ seg.className='led-seg'+(i<litCount?' lit-'+cls:''); });
+    const max = Math.max(...vals), min = Math.min(...vals), diff = max - min;
+    $('#cMax').textContent = max.toFixed(2); $('#cMin').textContent = min.toFixed(2); $('#cDiff').textContent = diff.toFixed(2);
+    spark(vals);
+    const stable = diff <= t, ok = stable && uOk !== false && pOk !== false;
+    verdict.className = 'verdict ' + (ok ? 'ok' : 'bad');
+    vt.textContent = `Señal ${stable ? 'ESTABLE' : 'INESTABLE'} · diferencia ${diff.toFixed(2)} dB (umbral ${t.toFixed(1)})` + (notes.length ? ' · ' + notes.join(' · ') : '');
   }
-  [ftthLevel, ftthFrom, ftthTo, ftthMargin].forEach(el=>el.addEventListener('input', computeFTTH));
-  $('#ftth-clear').addEventListener('click', ()=>{ ftthLevel.value=''; computeFTTH(); });
-
-  computeHFC(); computeFTTH();
+  [inp, thr, usnr, pow].forEach(el => el.addEventListener('input', run));
+  $('#coaxClear').addEventListener('click', () => { inp.value = ''; usnr.value = ''; pow.value = ''; run(); inp.focus(); });
+  run();
 }
 
 /* ════════════════════════════════════════════════════════════
-   TABLA TEMPORAL · editor con persistencia local
+   TABLAS RÁPIDAS + NOTAS
    ════════════════════════════════════════════════════════════ */
-function setupTabla(){
-  const table = $('#ttTable');
-  const notes = $('#ttNotes');
-  const statusEl = $('#ttStatus');
+const Tables = {
+  m:null, notes:null,
+  newTable(name){ return { id:uid(), name, cols:['SOT','Estado','Nota'], rows:[{ id:uid(), cells:['','',''], done:false }] }; },
 
-  let model = store.get('mda_tabla', null);
-  if(!model || !model.headers){
-    model = { headers: ['Cliente','SOT','Estado','Nota'], rows: [['','','','']] };
-  }
-  notes.value = store.get('mda_notas', '');
+  init(){
+    this.load();
+    this.saveT = debounce(() => LS.set(k('tables'), this.m), 150);
+    this.saveN = debounce(() => LS.set(k('notes'), this.notes), 150);
 
-  let saveT = null;
-  function save(){
-    clearTimeout(saveT);
-    saveT = setTimeout(()=>{
-      store.set('mda_tabla', model);
-      store.set('mda_notas', notes.value);
-      statusEl.textContent = 'Guardado · ' + new Date().toLocaleTimeString('es-PE');
-    }, 250);
-  }
-
-  function render(){
-    table.innerHTML = '';
-    const thead = document.createElement('thead');
-    const htr = document.createElement('tr');
-    htr.appendChild(th(''));
-    model.headers.forEach((h, ci) => {
-      const cell = th('');
-      cell.contentEditable = 'true';
-      cell.textContent = h;
-      cell.addEventListener('input', () => { model.headers[ci] = cell.textContent; save(); });
-      const del = document.createElement('span');
-      del.className = 'col-del'; del.textContent = ' ✕'; del.title = 'Eliminar columna';
-      del.addEventListener('click', () => { model.headers.splice(ci,1); model.rows.forEach(r=>r.splice(ci,1)); render(); save(); });
-      cell.appendChild(del);
-      htr.appendChild(cell);
+    $('#qtNew').addEventListener('click', () => {
+      const t = this.newTable('Tabla ' + (this.m.list.length + 1));
+      this.m.list.push(t); this.m.active = t.id; this.saveT(); this.renderAll();
+      $('#qtName').select();
     });
-    thead.appendChild(htr); table.appendChild(thead);
+    $('#qtName').addEventListener('input', e => { this.cur().name = e.target.value; this.saveT(); this.renderList(); });
+    $('#qtAddRow').addEventListener('click', () => this.addRow(true));
+    $('#qtAddCol').addEventListener('click', () => {
+      const t = this.cur(); t.cols.push('Columna ' + (t.cols.length + 1)); t.rows.forEach(r => r.cells.push(''));
+      this.saveT(); this.renderTable();
+      const ins = $$('#qtTable th input'); ins[ins.length - 1].select();
+    });
+    $('#qtSearch').addEventListener('input', () => this.filter());
+    $('#noteNew').addEventListener('click', () => {
+      this.notes.unshift({ id:uid(), text:'', t:Date.now() }); this.saveN(); this.renderNotes();
+      const ta = $('#notes textarea'); if(ta) ta.focus();
+    });
 
-    const tbody = document.createElement('tbody');
-    model.rows.forEach((row, ri) => {
-      const tr = document.createElement('tr');
-      const del = document.createElement('td');
-      del.className = 'row-del'; del.textContent = '✕'; del.title = 'Eliminar fila';
-      del.addEventListener('click', () => { model.rows.splice(ri,1); render(); save(); });
-      tr.appendChild(del);
-      model.headers.forEach((_, ci) => {
-        const td = document.createElement('td');
-        td.contentEditable = 'true';
-        td.textContent = row[ci] != null ? row[ci] : '';
-        td.addEventListener('input', () => { model.rows[ri][ci] = td.textContent; save(); });
-        tr.appendChild(td);
+    window.addEventListener('storage', e => {
+      if(e.key === k('tables') || e.key === k('notes')){
+        const busy = document.activeElement && document.activeElement.closest('#view-tablas');
+        if(!busy){ this.load(); this.renderAll(); }
+      }
+    });
+    this.renderAll();
+  },
+
+  load(){
+    this.m = LS.get(k('tables'), null);
+    if(!this.m || !Array.isArray(this.m.list) || !this.m.list.length){
+      const t = this.newTable('SOTs por revisar'); this.m = { active:t.id, list:[t] };
+    }
+    if(!this.m.list.find(t => t.id === this.m.active)) this.m.active = this.m.list[0].id;
+    this.notes = LS.get(k('notes'), []);
+    if(!Array.isArray(this.notes)) this.notes = [];
+  },
+  cur(){ return this.m.list.find(t => t.id === this.m.active); },
+  renderAll(){ this.renderList(); this.renderTable(); this.renderNotes(); },
+
+  renderList(){
+    const ul = $('#qtList');
+    ul.innerHTML = this.m.list.map(t => {
+      const pend = t.rows.filter(r => !r.done && r.cells.some(c => c.trim())).length;
+      return `<li class="${t.id === this.m.active ? 'is-on' : ''}" data-id="${t.id}">
+        <button type="button" class="pick">${esc(t.name || 'Sin nombre')}<small>${t.rows.length} filas · ${pend} pendientes</small></button>
+        <button type="button" class="del" aria-label="Eliminar tabla ${esc(t.name)}">×</button></li>`;
+    }).join('');
+    $$('li', ul).forEach(li => {
+      $('.pick', li).addEventListener('click', () => { this.m.active = li.dataset.id; this.saveT(); this.renderAll(); });
+      $('.del', li).addEventListener('click', () => {
+        const t = this.m.list.find(x => x.id === li.dataset.id);
+        if(!confirm(`¿Eliminar la tabla “${t.name}”?`)) return;
+        this.m.list = this.m.list.filter(x => x.id !== t.id);
+        if(!this.m.list.length) this.m.list.push(this.newTable('SOTs por revisar'));
+        if(this.m.active === t.id) this.m.active = this.m.list[0].id;
+        this.saveT(); this.renderAll();
       });
-      tbody.appendChild(tr);
     });
-    table.appendChild(tbody);
+  },
+
+  renderTable(){
+    const t = this.cur(), table = $('#qtTable');
+    $('#qtName').value = t.name;
+    const head = `<thead><tr>${t.cols.map((c, i) => `<th><div class="th-in"><input value="${esc(c)}" data-col="${i}" aria-label="Nombre de columna">${t.cols.length > 1 ? `<button type="button" class="coldel" data-col="${i}" aria-label="Eliminar columna">×</button>` : ''}</div></th>`).join('')}<th class="c-act"></th></tr></thead>`;
+    const body = `<tbody>${t.rows.map(r => `<tr data-id="${r.id}" class="${r.done ? 'done' : ''}">${r.cells.map((c, i) => `<td><input value="${esc(c)}" data-c="${i}" aria-label="${esc(t.cols[i] || '')}"></td>`).join('')}<td class="c-act"><button type="button" class="chk" title="Marcar revisada" aria-label="Marcar revisada">✓</button><button type="button" class="cp" title="Copiar primera celda" aria-label="Copiar primera celda"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5.5" y="5.5" width="8" height="8"/><path d="M10.5 5.5v-3h-8v8h3"/></svg></button><button type="button" class="del" title="Eliminar fila" aria-label="Eliminar fila">×</button></td></tr>`).join('')}</tbody>`;
+    table.innerHTML = head + body;
+
+    $$('th input', table).forEach(inp => inp.addEventListener('input', () => { t.cols[+inp.dataset.col] = inp.value; this.saveT(); }));
+    $$('th .coldel', table).forEach(b => b.addEventListener('click', () => {
+      const i = +b.dataset.col; t.cols.splice(i, 1); t.rows.forEach(r => r.cells.splice(i, 1)); this.saveT(); this.renderTable();
+    }));
+    $$('tbody tr', table).forEach(tr => {
+      const row = t.rows.find(r => r.id === tr.dataset.id);
+      $$('input', tr).forEach(inp => {
+        inp.addEventListener('input', () => { row.cells[+inp.dataset.c] = inp.value; this.saveT(); this.renderListSoon(); });
+        inp.addEventListener('keydown', e => {
+          if(e.key === 'Enter'){ e.preventDefault(); if(t.rows[t.rows.length - 1] === row) this.addRow(true); else { const nx = tr.nextElementSibling; if(nx) $(`input[data-c="${inp.dataset.c}"]`, nx).focus(); } }
+        });
+      });
+      $('.chk', tr).addEventListener('click', () => { row.done = !row.done; tr.classList.toggle('done', row.done); this.saveT(); this.renderList(); });
+      $('.cp', tr).addEventListener('click', () => { const v = (row.cells[0] || '').trim(); if(!v) return toast('Celda vacía', { warn:true }); copyText(v); toast('Copiado: ' + v); });
+      $('.del', tr).addEventListener('click', () => {
+        const idx = t.rows.indexOf(row); t.rows.splice(idx, 1);
+        if(!t.rows.length) t.rows.push({ id:uid(), cells:t.cols.map(() => ''), done:false });
+        this.saveT(); this.renderTable(); this.renderList();
+        toast('Fila eliminada', { ms:4000, action:{ label:'Deshacer', run:() => { t.rows.splice(idx, 0, row); this.saveT(); this.renderTable(); this.renderList(); } } });
+      });
+    });
+    this.filter();
+  },
+  renderListSoon: debounce(function(){ Tables.renderList(); }, 400),
+
+  addRow(focus){
+    const t = this.cur(); const r = { id:uid(), cells:t.cols.map(() => ''), done:false };
+    t.rows.push(r); this.saveT(); this.renderTable(); this.renderList();
+    if(focus){ const inp = $(`#qtTable tr[data-id="${r.id}"] input`); if(inp) inp.focus(); }
+  },
+
+  filter(){
+    const q = $('#qtSearch').value.trim().toLowerCase();
+    $$('#qtTable tbody tr').forEach(tr => {
+      tr.hidden = !!q && !$$('input', tr).some(i => i.value.toLowerCase().includes(q));
+    });
+  },
+
+  renderNotes(){
+    const box = $('#notes');
+    if(!this.notes.length){ box.innerHTML = `<div class="notes-empty">Sin notas. Usa “+ Nota” para apuntar algo rápido.</div>`; return; }
+    box.innerHTML = this.notes.map(n => `<div class="note" data-id="${n.id}">
+      <div class="note-head"><span>${new Date(n.t).toLocaleString('es-PE', { day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' })}</span><button type="button" aria-label="Eliminar nota">×</button></div>
+      <textarea aria-label="Nota" placeholder="Escribe…">${esc(n.text)}</textarea></div>`).join('');
+    $$('.note', box).forEach(el => {
+      const n = this.notes.find(x => x.id === el.dataset.id);
+      $('textarea', el).addEventListener('input', e => { n.text = e.target.value; n.t = Date.now(); this.saveN(); });
+      $('button', el).addEventListener('click', () => {
+        if(n.text.trim() && !confirm('¿Eliminar esta nota?')) return;
+        this.notes = this.notes.filter(x => x !== n); this.saveN(); this.renderNotes();
+      });
+    });
   }
-  function th(t){ const e=document.createElement('th'); e.textContent=t; return e; }
-
-  $('#ttAddRow').addEventListener('click', () => { model.rows.push(model.headers.map(()=>'')); render(); save(); });
-  $('#ttAddCol').addEventListener('click', () => {
-    model.headers.push('Columna ' + (model.headers.length+1));
-    model.rows.forEach(r => r.push('')); render(); save();
-  });
-  $('#ttExport').addEventListener('click', () => {
-    const data = model.rows.map(r => {
-      const o = {}; model.headers.forEach((h,i)=> o[h] = r[i] != null ? r[i] : ''); return o;
-    });
-    downloadJSON(data, 'tabla-temporal.json');
-    showToast('✓ JSON exportado');
-  });
-  $('#ttClear').addEventListener('click', () => {
-    if(confirm('¿Vaciar la tabla temporal? Esta acción no se puede deshacer.')){
-      model = { headers: ['Cliente','SOT','Estado','Nota'], rows: [['','','','']] };
-      notes.value=''; render(); save(); showToast('Tabla vaciada');
-    }
-  });
-  notes.addEventListener('input', save);
-
-  render();
-}
+};
 
 /* ════════════════════════════════════════════════════════════
-   TEPJ · Excel → JSON
+   SPEECHS (perfil especial)
+   Capa base: data/speeches.json. Capa local: lo editado aquí, guardado
+   codificado en este navegador (no viaja a ningún servidor). Mismo id =
+   misma tarjeta y mismo número.
    ════════════════════════════════════════════════════════════ */
-function setupTEPJ(){
-  const input = $('#tepjInput');
-  const headerChk = $('#tepjHeader');
-  const meta = $('#tepjMeta');
-  const tableEl = $('#tepjTable');
-  const jsonEl = $('#tepjJson');
+const SPEECH_FALLBACK = [
+  { id:'s1', tag:'Apertura', title:'Saludo inicial', text:'{saludo}, le saluda {agente} de la Mesa de Seguimiento de Claro. ¿Me comunico con {cliente}? Le llamo por su orden de servicio {sot}.' },
+  { id:'s5', tag:'Cierre', title:'Despedida', text:'Gracias por su tiempo, {cliente}. Su caso queda registrado con la orden {sot}. Le atendió {agente}. Que tenga un buen día.' }
+];
+const OBF_KEY = 'mda\u00b7sp\u00b7v1';
+function obfuscate(str){
+  const b = new TextEncoder().encode(str), kb = new TextEncoder().encode(OBF_KEY);
+  let bin = ''; b.forEach((x, i) => { bin += String.fromCharCode(x ^ kb[i % kb.length]); });
+  return btoa(bin);
+}
+function deobfuscate(s){
+  const bin = atob(s), kb = new TextEncoder().encode(OBF_KEY);
+  const b = new Uint8Array(bin.length); for(let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i) ^ kb[i % kb.length];
+  return new TextDecoder().decode(b);
+}
 
-  function detectDelim(text){
-    if(text.includes('\t')) return '\t';
-    if(text.includes(';') && !text.includes(',')) return ';';
-    if(text.includes(',')) return ',';
-    return '\n';
-  }
-  function parse(){
-    const raw = input.value.replace(/\r\n/g,'\n').replace(/\r/g,'\n');
-    if(!raw.trim()){ meta.textContent='Sin datos'; tableEl.innerHTML=''; jsonEl.textContent='[]'; return; }
-    const delim = detectDelim(raw);
-    const lines = raw.split('\n').filter(l => l.trim() !== '');
-    const useHeader = headerChk.checked;
-    const matrix = lines.map(l => delim === '\n' ? [l] : l.split(delim).map(c => c.trim()));
-    const cols = matrix[0].length;
-    const headerRow = useHeader ? matrix.shift() : matrix[0].map((_,i)=>'Col'+(i+1));
-    const data = matrix.map(r => {
-      const o = {}; headerRow.forEach((h,i)=> o[h] = r[i] != null ? r[i] : '');
-      return (cols === 1 && r.length === 1) ? r[0] : o;
+const Speech = {
+  base:[], layer:[], editing:null, ready:false,
+
+  async init(){
+    window.Speech = this;
+    this.layer = this.readLayer();
+    try{
+      const r = await fetch('data/speeches.json', { cache:'no-store', credentials:'omit', referrerPolicy:'no-referrer' });
+      const j = await r.json();
+      this.base = Array.isArray(j) ? j : (j.items || []);
+    }catch(e){ this.base = SPEECH_FALLBACK; }
+
+    $('#speechBtn').addEventListener('click', () => $('#speechDrawer').hidden ? this.open() : this.close());
+    $('#spClose').addEventListener('click', () => this.close());
+    $('#spSearch').addEventListener('input', () => this.render());
+    $('#spNewBtn').addEventListener('click', () => this.edit(null));
+    $('#spCancel').addEventListener('click', () => this.showList());
+    $('#spEdit').addEventListener('submit', e => { e.preventDefault(); this.saveEdit(); });
+    $('#spLayerBtn').addEventListener('click', () => $('#spLayer').hidden ? this.showLayer() : this.showList());
+    $('#spLayerApply').addEventListener('click', () => this.applyLayer());
+    $('#spLayerCopy').addEventListener('click', () => { copyText($('#spLayerText').value); toast('Capa copiada'); });
+    $('#spReset').addEventListener('click', () => {
+      if(!confirm('¿Borrar la capa local? Se vuelve al archivo base.')) return;
+      this.layer = []; this.writeLayer(); this.showList(); toast('Capa local borrada');
     });
-    const final = useHeader ? data : matrix.map(r => r.length === 1 ? r[0] : r);
-    meta.textContent = `${matrix.length} fila(s) de datos · ${cols} columna(s)${useHeader ? " · encabezado detectado" : ""}`;
-    renderPreview(headerRow, matrix);
-    jsonEl.textContent = JSON.stringify(final, null, 2);
-  }
-  function renderPreview(headerRow, matrix){
-    tableEl.innerHTML='';
-    const thead=document.createElement('thead'); const htr=document.createElement('tr');
-    htr.appendChild(th(''));
-    headerRow.forEach(h=>{ const c=th(h); c.contentEditable='true'; htr.appendChild(c); });
-    thead.appendChild(htr); tableEl.appendChild(thead);
-    const tbody=document.createElement('tbody');
-    matrix.slice(0,50).forEach(row=>{
-      const tr=document.createElement('tr'); tr.appendChild(td(''));
-      row.forEach(c=> tr.appendChild(td(c))); tbody.appendChild(tr);
+    window.addEventListener('storage', e => { if(e.key === k('spx')){ this.layer = this.readLayer(); this.render(); } });
+    this.ready = true;
+    this.render();
+  },
+
+  readLayer(){
+    try{ const raw = localStorage.getItem(k('spx')); return raw ? JSON.parse(deobfuscate(raw)) : []; }catch(e){ return []; }
+  },
+  writeLayer(){ try{ localStorage.setItem(k('spx'), obfuscate(JSON.stringify(this.layer))); }catch(e){} },
+
+  merged(){
+    const out = this.base.map(b => Object.assign({ _base:true }, b));
+    this.layer.forEach(l => {
+      const i = out.findIndex(o => o.id === l.id);
+      if(i >= 0) out[i] = Object.assign({}, out[i], l);
+      else out.push(Object.assign({ _base:false }, l));
     });
-    tableEl.appendChild(tbody);
+    return out.filter(o => !o._hidden);
+  },
+
+  vars(text, mark){
+    const h = new Date().getHours();
+    const agent = ($('#agent').value || '').replace(/\s*-\s*A365\s*$/i, '').trim();
+    const map = {
+      saludo: h < 12 ? 'Buenos días' : h < 19 ? 'Buenas tardes' : 'Buenas noches',
+      agente: agent, sot: (Gen.st && Gen.st.sot || '').trim(), cliente: (Gen.st && Gen.st.vals.cliente || '').trim()
+    };
+    return text.replace(/\{(\w+)\}/g, (m, key) => {
+      if(!(key in map)) return m;
+      if(map[key]) return mark ? '\u0001' + map[key] + '\u0002' : map[key];
+      return mark ? '\u0003' + m + '\u0004' : m;
+    });
+  },
+
+  render(){
+    if(!this.ready) return;
+    const q = $('#spSearch').value.trim().toLowerCase();
+    const list = this.merged();
+    const html = list.map((s, i) => ({ s, n:i + 1 }))
+      .filter(({ s }) => !q || [s.title, s.text, s.tag].join(' ').toLowerCase().includes(q))
+      .map(({ s, n }) => {
+        const body = esc(this.vars(s.text || '', true)).replace(/\u0001/g, '<b>').replace(/\u0002/g, '</b>').replace(/\u0003/g, '<mark>').replace(/\u0004/g, '</mark>');
+        return `<article class="sp-card" data-id="${esc(s.id)}">
+          <div class="sp-top"><span class="sp-num">${pad2(n)}</span><span class="sp-title">${esc(s.title || 'Sin título')}</span>${s.tag ? `<span class="sp-tag">${esc(s.tag)}</span>` : ''}</div>
+          <div class="sp-text">${body}</div>
+          <div class="sp-actions"><button type="button" class="copy">Copiar</button><button type="button" class="ed">Editar</button><button type="button" class="del">Eliminar</button></div>
+        </article>`;
+      }).join('');
+    $('#spList').innerHTML = html || `<div class="notes-empty">Sin speechs${q ? ' para esa búsqueda' : ''}.</div>`;
+    $$('#spList .sp-card').forEach(card => {
+      const s = list.find(x => x.id === card.dataset.id);
+      $('.copy', card).addEventListener('click', () => { copyText(this.vars(s.text || '', false)); toast('Speech copiado'); });
+      $('.ed', card).addEventListener('click', () => this.edit(s));
+      $('.del', card).addEventListener('click', () => this.remove(s));
+    });
+  },
+
+  open(){ $('#app').classList.add('sp-open'); $('#speechDrawer').hidden = false; $('#speechBtn').setAttribute('aria-expanded', 'true'); this.showList(); $('#spSearch').focus(); },
+  close(){ const d = $('#speechDrawer'); if(!d || d.hidden) return; d.hidden = true; $('#app').classList.remove('sp-open'); $('#speechBtn').setAttribute('aria-expanded', 'false'); },
+  showList(){ $('#spEdit').hidden = true; $('#spLayer').hidden = true; $('#spList').hidden = false; $('#spSearch').hidden = false; this.render(); },
+
+  edit(s){
+    this.editing = s ? s.id : null;
+    $('#spTitle').value = s ? s.title || '' : '';
+    $('#spTag').value = s ? s.tag || '' : '';
+    $('#spText').value = s ? s.text || '' : '';
+    $('#spList').hidden = true; $('#spLayer').hidden = true; $('#spSearch').hidden = true; $('#spEdit').hidden = false;
+    $('#spTitle').focus();
+  },
+  saveEdit(){
+    const item = { id:this.editing || 'u' + uid(), title:$('#spTitle').value.trim(), tag:$('#spTag').value.trim(), text:$('#spText').value };
+    if(!item.title || !item.text.trim()) return toast('Título y texto son obligatorios', { warn:true });
+    const i = this.layer.findIndex(l => l.id === item.id);
+    if(i >= 0) this.layer[i] = item; else this.layer.push(item);
+    this.writeLayer(); this.showList(); toast('Speech guardado');
+  },
+  remove(s){
+    if(!confirm(`¿Eliminar “${s.title}”?`)) return;
+    const isBase = this.base.some(b => b.id === s.id);
+    this.layer = this.layer.filter(l => l.id !== s.id);
+    if(isBase) this.layer.push({ id:s.id, _hidden:true });
+    this.writeLayer(); this.render(); toast('Speech eliminado');
+  },
+
+  showLayer(){
+    $('#spLayerText').value = JSON.stringify({ version:1, items:this.layer }, null, 2);
+    $('#spList').hidden = true; $('#spEdit').hidden = true; $('#spSearch').hidden = true; $('#spLayer').hidden = false;
+  },
+  applyLayer(){
+    let j;
+    try{ j = JSON.parse($('#spLayerText').value); }catch(e){ return toast('JSON inválido: ' + e.message, { warn:true, ms:4000 }); }
+    const items = Array.isArray(j) ? j : j && j.items;
+    if(!Array.isArray(items) || items.some(x => !x || typeof x.id !== 'string' || !x.id)) return toast('Cada elemento necesita un "id" de texto', { warn:true, ms:4000 });
+    this.layer = items; this.writeLayer(); this.showList(); toast(`Capa aplicada · ${items.length} elemento(s)`);
   }
-  function th(t){ const e=document.createElement('th'); e.textContent=t; return e; }
-  function td(t){ const e=document.createElement('td'); e.textContent=t; return e; }
+};
 
-  input.addEventListener('input', debounce(parse, 200));
-  headerChk.addEventListener('change', parse);
-  $('#tepjCopy').addEventListener('click', () => {
-    const txt = jsonEl.textContent;
-    if(!txt || txt === '[]'){ showToast('⚠️ Nada que copiar','warn'); return; }
-    copyText(txt, () => showToast('✓ JSON copiado'));
-  });
-  $('#tepjDownload').addEventListener('click', () => {
-    const txt = jsonEl.textContent;
-    if(!txt || txt === '[]'){ showToast('⚠️ Nada que descargar','warn'); return; }
-    downloadJSONText(txt, 'tepj.json'); showToast('✓ JSON descargado');
-  });
-}
-function debounce(fn, ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
-function copyText(text, done){
-  if(navigator.clipboard && navigator.clipboard.writeText){
-    navigator.clipboard.writeText(text).then(done).catch(()=>fallbackCopy(text,done));
-  } else fallbackCopy(text, done);
-}
-function fallbackCopy(text, done){
-  const ta=document.createElement('textarea'); ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
-  document.body.appendChild(ta); ta.select(); try{ document.execCommand('copy'); }catch(e){} document.body.removeChild(ta); done();
-}
-function downloadJSON(obj, filename){ downloadJSONText(JSON.stringify(obj, null, 2), filename); }
-function downloadJSONText(text, filename){
-  const blob = new Blob([text], {type:'application/json'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click();
-  document.body.removeChild(a); URL.revokeObjectURL(url);
-}
-
-/* ════════════════════════════════════════════════════════════
-   ACCESOS · enlaces de la mesa de ayuda
-   ════════════════════════════════════════════════════════════ */
-function setupAccesos(){
-  const links = [
-    {t:'SIOP', d:'Marca tu asistencia', url:'https://siop.a365.com.pe/index.php'},
-    {t:'AICC', d:'Para realizar llamadas', url:'https://10.189.8.188:28090/service-cloud/aicc-web/index/index.html#/login'},
-    {t:'TOA', d:'SG Técnico en Campo', url:'https://amx-peru.fs.ocs.oraclecloud.com/'},
-    {t:'Laraigo', d:'TK de Atención TC', url:'https://claro.laraigo.com/sign-in'},
-    {t:'360', d:'TK de Atención TC', url:'https://claro360.com/plataforma360/'},
-    {t:'REMEDY', d:'SOT de Reemplazo', url:'https://claro360.com/plataforma360/Peru/soporte_remoto'},
-    {t:'Zymbra', d:'Webmail', url:'https://correo.grupoa365.com:8443/?loginOp=logout'},
-    {t:'ODN', d:'Verificación de FAT y clientes', url:'https://192.168.57.45:31943/ncecommonwebsite/v1/newportal/index.html?refr-flags=e'},
-    {t:'Incognito', d:'Niveles y equipos', url:'http://172.17.51.6/sac/Login_input'},
-    {t:'Incognito ACS', d:'Conexión, equipos y repetidor', url:'http://172.19.196.16:8080/acs/index.xhtml'},
-    {t:'SKYWAY', d:'Conexión IPTV', url:'https://www.skywayplatform.com/skyway-platform/login?tenantCode=1086&backUrl'},
-    {t:'CES FIJA', d:'Servicios fijos', url:'http://intranetces.tim.com.pe/'},
-    {t:'SISEF', d:'TK Cobertura AM0', url:'https://gestorsisef.claro.pe/ords/r/ws_srvfija/srvfija/login'},
-    {t:'Geodir', d:'Mapas de cobertura', url:'https://maps.geodir.co/bravo-maps'},
-    {t:'Factibilidad', d:'Factibilidad de cobertura', url:'https://172.19.90.243/portalfactibilidad/public/buscar-casa-direccion/31'}
-  ];
-  const grid = $('#linkGrid');
-  grid.innerHTML = links.map(l =>
-    `<a class="link-item" href="${l.url}" target="_blank" rel="noopener"><span class="t">${l.t}</span><span class="d">${l.d}</span></a>`
-  ).join('');
-}
+/* ───────────────────────── Arranque ───────────────────────── */
+(async function boot(){
+  setupGate();
+  const p = await resumeSession();
+  if(p) enterApp(p);
+  else { $('#gate').hidden = false; $('#gatePass').focus(); }
+})();
